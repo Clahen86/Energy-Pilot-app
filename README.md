@@ -50,6 +50,13 @@ Uden Android: [GitHub Pages](https://clahen86.github.io/Energy-Pilot-app/) viser
 **Telefonen skal være hjemme og appen åben** for at styre. Til fast drift: en gammel Android-telefon/tablet i strøm
 derhjemme med appen åben. (Kørsel i baggrunden kommer senere.)
 
+## Opdateringer kommer af sig selv
+
+Appen henter selv nye versioner af panelet og kernen fra GitHub Pages (`www/version.json`) ved opstart og hver 3. time,
+og viser "Energipilot x.y er hentet – Genstart". Startsiden (`www/index.html`) kører den nyeste version, appen har.
+Kun når selve Android-delen ændres (`android-src/`, `capacitor.config.json`), skal en ny APK installeres – så siger
+appen det. `?ota=0` starter altid den indbyggede version.
+
 ## Kernen følger Home Assistant-appen
 
 - `CORE_SOURCE.json` siger, hvilken version af Energy-pilot appen bygger på.
@@ -79,7 +86,9 @@ på de gamle. Til Google Play: brug en hemmelig nøgle via `EP_KEYSTORE`, `EP_KE
 ## Struktur
 
 ```
-www/index.html            panelet + bro (bygges af tools/build_index.py)
+www/index.html            startside: kører den nyeste version (indbygget eller hentet)
+www/app.html              panelet + bro (bygges af tools/build_index.py)
+www/version.json          versionen, appen sammenligner med for at opdatere sig selv
 www/panel.html            panelet, uændret fra HA-appen
 www/js/bridge.js          Pyodide, API-routing, forbindelses-skærm, native UDP
 www/py/energy_pilot/      kernen, uændret fra HA-appen

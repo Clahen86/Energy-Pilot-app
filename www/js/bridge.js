@@ -132,7 +132,11 @@
     await persist(py, true);
 
     step('Lægger Energipilot ind…', 70);
-    const bundle = await (await realFetch('py/bundle.json')).json();
+    let bundle = null;
+    if (window.EP_OTA) {  // a newer version the app fetched itself (see "Automatisk opdatering" below)
+      try { bundle = JSON.parse(localStorage.getItem('ep_ota_bundle') || 'null'); } catch (e) { bundle = null; }
+    }
+    if (!bundle) bundle = await (await realFetch('py/bundle.json')).json();
     const files = Object.keys(bundle);
     const texts = files.map((f) => bundle[f]);
     files.forEach((f, i) => {
@@ -165,6 +169,8 @@
       document.body.appendChild(tag);
     }
     addConnButton();
+    setTimeout(checkUpdate, 20000);
+    setInterval(checkUpdate, 3 * 3600 * 1000);
   }
 
   // ---------- Forbindelser (kun i appen – ikke en del af panelet fra Home Assistant) ----------
@@ -265,6 +271,73 @@
     }
     status();
     timer = setInterval(status, 3000);
+  }
+
+  // ---------- Automatisk opdatering ----------
+  // The app fetches the newest panel and core from GitHub Pages and stores them on the phone; the starter page
+  // (index.html) runs them next time. Only a change to the Android part itself needs a new APK - then it says so.
+  const UPDATE_BASE = 'https://clahen86.github.io/Energy-Pilot-app/www/';
+  const RELEASE_URL = 'https://github.com/Clahen86/Energy-Pilot-app/releases/tag/android-latest';
+
+  async function runningVersion() {
+    if (window.EP_OTA) return window.EP_OTA;
+    try { return await (await realFetch('version.json', { cache: 'no-store' })).json(); } catch (e) { return null; }
+  }
+
+  async function checkUpdate() {
+    if (DEV || /github\.io$/.test(location.hostname) || location.protocol === 'file:') return;
+    try {
+      const cur = await runningVersion();
+      const r = await realFetch(UPDATE_BASE + 'version.json?t=' + Date.now(), { cache: 'no-store' });
+      if (!r.ok) return;
+      const nv = await r.json();
+      if (!cur || !nv || nv.id === cur.id || !(nv.built > cur.built)) return;
+      if (nv.native !== cur.native) {
+        updateBanner('Ny Android-app (Energipilot ' + nv.core + ') er klar', 'Hent den', () => { window.open(RELEASE_URL, '_system'); });
+        return;
+      }
+      const stored = JSON.parse(localStorage.getItem('ep_ota_meta') || 'null');
+      if (!stored || stored.id !== nv.id) {
+        const get = async (f) => { const x = await realFetch(UPDATE_BASE + f + '?v=' + nv.id, { cache: 'no-store' }); if (!x.ok) throw new Error(f); return x.text(); };
+        const [html, bridge, bundle] = await Promise.all([get('app.html'), get('js/bridge.js'), get('py/bundle.json')]);
+        JSON.parse(bundle);  // must be whole
+        if (html.indexOf('<script src="js/bridge.js"></script>') < 0) return;
+        const page = html.replace('<script src="js/bridge.js"></script>', () => '<script>' + bridge.replace(/<\/script/gi, '<\\/script') + '</script>');
+        try {
+          localStorage.setItem('ep_ota_html', page);
+          localStorage.setItem('ep_ota_bundle', bundle);
+          localStorage.setItem('ep_ota_meta', JSON.stringify(nv));
+        } catch (e) {
+          ['ep_ota_html', 'ep_ota_bundle', 'ep_ota_meta'].forEach((k) => { try { localStorage.removeItem(k); } catch (e2) { /* */ } });
+          return;
+        }
+      }
+      updateBanner('Energipilot ' + nv.core + ' er hentet', 'Genstart', () => {
+        try { boot && boot.save(); } catch (e) { /* */ }
+        location.replace('index.html');
+      });
+    } catch (e) { /* offline or GitHub unreachable: try again later */ }
+  }
+
+  function updateBanner(text, button, action) {
+    if (document.getElementById('ep-update')) return;
+    const b = document.createElement('div');
+    b.id = 'ep-update';
+    b.style.cssText = 'position:fixed;left:12px;right:12px;bottom:calc(env(safe-area-inset-bottom) + 160px);z-index:70;background:#131924;' +
+      'color:#f3f5f9;border:1px solid rgba(124,108,255,.5);border-radius:14px;padding:12px 14px;display:flex;align-items:center;gap:10px;' +
+      'font:14px -apple-system,system-ui,sans-serif;box-shadow:0 8px 30px rgba(0,0,0,.4)';
+    b.innerHTML = '<div style="flex:1">' + esc(text) + '</div>';
+    const go = document.createElement('button');
+    go.textContent = button;
+    go.style.cssText = 'background:#7c6cff;color:#fff;border:0;border-radius:10px;padding:9px 12px;font-weight:600';
+    go.onclick = action;
+    const x = document.createElement('button');
+    x.textContent = '✕';
+    x.style.cssText = 'background:none;border:0;color:#8b93a3;font-size:16px;padding:4px';
+    x.onclick = () => b.remove();
+    b.appendChild(go);
+    b.appendChild(x);
+    document.body.appendChild(b);
   }
 
   // ---------- Panelets API-kald går til Python ----------
