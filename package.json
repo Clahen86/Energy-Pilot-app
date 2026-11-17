@@ -1,12 +1,13 @@
 {
   "name": "energy-pilot-app",
-  "version": "0.1.0",
-  "description": "Energipilot som selvstændig mobilapp: planlægger batteri, solceller og elbil efter de billigste elpriser – uden Home Assistant.",
+  "version": "0.2.0",
+  "description": "Energipilot som selvstændig mobilapp: samme Python-kerne som Home Assistant-appen, kørt i Pyodide – uden Home Assistant.",
   "license": "MIT",
   "private": true,
   "scripts": {
-    "test": "node --test tests/*.test.js",
-    "serve": "npx --yes http-server www -p 8080 -c-1",
+    "build": "python3 tools/build_manifest.py && python3 tools/build_index.py",
+    "dev": "python3 tools/dev_server.py",
+    "test": "python3 -m unittest discover tests",
     "android": "npx cap sync android && npx cap open android",
     "ios": "npx cap sync ios && npx cap open ios"
   },

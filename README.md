@@ -1,84 +1,95 @@
 # Energipilot – selvstændig app
 
-Energipilot som en almindelig mobilapp til iPhone og Android, **uden Home Assistant**.
-Den planlægger hjemmebatteri, solceller og elbil efter de billigste elpriser i kvarterstimer.
+Energipilot som en almindelig mobilapp til iPhone og Android – **uden Home Assistant**.
 
-Søsterprojekt til [Energy-pilot](https://github.com/Clahen86/Energy-pilot) (Home Assistant-appen).
+Appen kører **den samme Python-kerne** som Home Assistant-appen [Energy-pilot](https://github.com/Clahen86/Energy-pilot):
+planlægning i kvarterstimer, læring med ML, auto-genkendelse, profiler til invertere og ladere, besparelser,
+selvtest og hele panelet. Forskellen er kun, hvor enhederne kommer fra.
 
-## Hvad den kan
+## Sådan virker det
 
-- **Spotpriser** for DK1/DK2 i kvarterer fra Energi Data Service, inkl. nettarif, afgifter og moms.
-  Før kl. 13 estimeres morgendagen, så bilen kan planlægges hen over natten.
-- **Sol- og vejrprognose** fra Open-Meteo.
-- **Plan for batteriet**: optimal opladning/afladning (dynamisk programmering over ladetilstand).
-- **Plan for elbilen**: de billigste kvarterer før klar-tidspunktet, solcelleoverskud først. Knap til "Lad nu".
-- **Lærer husets forbrug** pr. ugedag og time.
-- **Besparelser**: samme hus med og uden batteri, plus hvad den lagrede strøm har kostet.
-- **Skyggetilstand** som standard – appen viser hvad den ville gøre uden at styre noget.
-- **Drivere** til forskellige invertere og ladere bag ét fælles interface (`www/js/drivers.js`).
-- Dansk brugerflade. Alle data og konti gemmes kun på telefonen.
-
-## Status for drivere
-
-| Enhed | Forbindelse | Status |
-|---|---|---|
-| Demo (simuleret hus og elbil) | – | ✅ klar |
-| Growatt SPH / MIN / MOD | cloud (OpenAPI) | 🚧 under udvikling |
-| KEBA KeContact | lokal UDP 7090 | 🚧 under udvikling |
-| Fox ESS, GivEnergy, Deye, Sungrow, Huawei | cloud | planlagt |
-| SolaX, SolarEdge | lokal Modbus TCP | planlagt |
-| Easee, Zaptec, Wallbox | cloud | planlagt |
-| go-e | lokal HTTP | planlagt |
-
-## Prøv den i browseren
-
-Appen er ren HTML/JavaScript, så den kan køre direkte i en browser:
-
-```bash
-npm run serve        # åbn http://localhost:8080
+```
+┌──────────────── appen (WebView) ────────────────┐
+│  panelet (samme index.html som i HA-appen)      │
+│        │  fetch("api/…")                        │
+│        ▼                                        │
+│  js/bridge.js  ──►  Pyodide (Python i appen)    │
+│                       energy_pilot/*  (uændret) │
+│                       standalone/virtual_ha.py  │
+│                       standalone/devices/*      │
+└───────────────────────────│─────────────────────┘
+                            ▼
+          inverter · lader · priser (Modbus, UDP, cloud …)
 ```
 
-Eller slå **GitHub Pages** til for repoet (Settings → Pages → Deploy from branch → `main` / root),
-så kører den på `https://clahen86.github.io/energy-pilot-app/` med live priser og vejr.
-På telefonen: åbn siden og vælg "Føj til hjemmeskærm".
+- **Pyodide** kører Python med numpy og scikit-learn direkte i appen.
+- **`standalone/virtual_ha.py`** er et lille Home Assistant med samme interface som `energy_pilot/ha.py`
+  (states, services, recorder/statistik, registry). Kernen mærker ingen forskel.
+- **Drivere** (`standalone/devices/`) laver de samme entities, som HA-integrationerne ville lave
+  (`select.growatt_work_mode_priority`, `keba.set_current` …). Derfor virker auto-genkendelse og profilerne i
+  `adapters.py` uden ændringer.
+- **`aiohttp`-shim** (`www/py/aiohttp/`) sender kernens HTTP-kald gennem appens fetch (native HTTP i Capacitor).
+- Intet sendes ud af telefonen (rapport-tjenesten er slået fra).
 
-## Byg som rigtig app (Android og iPhone)
+## Status
 
-Appen pakkes med [Capacitor](https://capacitorjs.com), så den samme kode bliver en native app.
+| Del | Status |
+|---|---|
+| Energy Pilot-kernen og panelet | ✅ kører (samme kode som HA-appen, commit `430feaf`) |
+| Demo: simuleret Growatt SPH + KEBA + Energi Data Service | ✅ |
+| Driver: Growatt SPH (Modbus TCP) | 🚧 næste skridt |
+| Driver: KEBA (UDP 7090) | 🚧 |
+| Andre invertere/ladere | planlagt – samme mønster |
+| Kørsel i baggrunden | Android: forgrundstjeneste (planlagt). iPhone: kun mens appen er åben |
+
+## Prøv den
+
+**I browseren (Pyodide):** åbn `www/index.html` via en webserver, fx GitHub Pages
+(Settings → Pages → Deploy from branch → `main` / root) → `https://clahen86.github.io/energy-pilot-app/www/`.
+
+**Hurtigt på computeren (uden Pyodide):** samme kerne i almindelig Python.
+
+```bash
+pip install numpy scikit-learn
+python3 tools/dev_server.py      # åbn http://localhost:8099/?dev=1
+```
+
+## Byg som rigtig app
 
 ```bash
 npm install
-npx cap add android      # første gang
-npx cap add ios          # første gang (kræver Mac med Xcode)
-npm run android          # åbner projektet i Android Studio → Run
-npm run ios              # åbner projektet i Xcode → Run
+npx cap add android              # første gang
+npx cap add ios                  # første gang (Mac med Xcode)
+npm run android                  # eller: npm run ios
 ```
 
-I den native app bruges native HTTP (`CapacitorHttp`), så producenternes API'er kan kaldes direkte.
-Lokale protokoller (KEBA UDP, Modbus TCP) kræver et ekstra Capacitor-plugin og at telefonen er på samme wifi.
+Til den native app bør Pyodide ligge i pakken, så den virker uden net ved opstart: hent Pyodide-distributionen
+og læg den i `www/pyodide/` (bridge.js bruger den lokale kopi først og ellers jsDelivr).
+
+## Opdatér kernen fra Home Assistant-appen
+
+```bash
+cp -r ../Energy-pilot/energy_pilot/energy_pilot/*.py www/py/energy_pilot/
+cp ../Energy-pilot/energy_pilot/energy_pilot/frontend/index.html www/panel.html
+cp ../Energy-pilot/energy_pilot/energy_pilot/frontend/suggest.js www/static/
+python3 tools/build_manifest.py && python3 tools/build_index.py
+python3 -m unittest discover tests
+```
 
 ## Struktur
 
 ```
 www/
-  index.html          brugerflade
-  css/style.css
-  js/planner.js       priser, prognoser og optimering (ingen afhængigheder)
-  js/sources.js       Energi Data Service og Open-Meteo (med demodata som reserve)
-  js/drivers.js       driver-interface og drivere til invertere og ladere
-  js/app.js           skærme, live-visning og styring
-tests/                tests af planlæggeren (npm test)
-capacitor.config.json
+  index.html            panelet + bro (bygges af tools/build_index.py fra panel.html)
+  panel.html            panelet, uændret fra HA-appen
+  js/bridge.js          Pyodide, filer, API-routing
+  py/energy_pilot/      kernen, uændret fra HA-appen
+  py/standalone/        virtuel Home Assistant, opstart og drivere
+  py/aiohttp/           lille aiohttp-erstatning (fetch)
+  py/bundle.json        al Python-koden i én fil (tools/build_manifest.py)
+tools/                  byg- og udviklingsværktøjer
+tests/                  røgtest af den selvstændige kerne
 ```
-
-## Tilføj en ny inverter eller lader
-
-1. Tilføj den til `EP.DRIVERS` i `www/js/drivers.js`.
-2. Skriv en klasse med `getLive()` og `applyPlan(plan)` (ladere også `chargeNow(on)`).
-3. Registrér den i `EP.createInverter` / `EP.createCharger`.
-
-Invertere, der kun kan gemme et fast antal tidsrum (fx Growatt SPH med 3), kan bruge
-`EP.compressToBlocks(plan, 3)` til at gøre planen om til de vigtigste lade- og afladeblokke.
 
 ## Licens
 

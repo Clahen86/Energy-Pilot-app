@@ -1,0 +1,346 @@
+"""Self-check: settings that make the plan worse, each with a plain explanation and (when it can) a one-tap fix.
+
+A wrong number - an import limit set too low, a battery size off by a few kWh - quietly spoils the plan, and
+nothing told the user. These checks look at what Energy Pilot has measured and planned, and say so.
+"""
+
+from __future__ import annotations
+
+import re
+from datetime import datetime
+from typing import Any
+
+
+class GridPeak:
+    """The most the house has really bought from the grid (kW, two-minute average) - kept for 30 days."""
+
+    def __init__(self, state: dict[str, Any]) -> None:
+        self.state = state
+        self._recent: list[float] = []
+
+    def see(self, now: datetime, grid_w: float | None) -> None:
+        if grid_w is None:
+            return
+        self._recent = (self._recent + [max(0.0, grid_w) / 1000])[-4:]  # 4 x 30 s
+        if len(self._recent) < 4:
+            return
+        kw = sum(self._recent) / 4
+        p = self.state.get("grid_peak") or {}
+        old = p.get("at")
+        stale = old is None or (now - datetime.fromisoformat(old)).days >= 30
+        if stale or kw > p.get("kw", 0):
+            self.state["grid_peak"] = {"kw": round(kw, 2), "at": now.isoformat()}
+
+    def kw(self) -> float | None:
+        return (self.state.get("grid_peak") or {}).get("kw")
+
+
+# The most common main fuse for a house, by country: (kW, as people know it). Only where one size is common.
+USUAL_FUSE = {"DK": (17, "3 × 25 A"), "SE": (17, "3 × 25 A"), "FI": (17, "3 × 25 A"), "DE": (24, "3 × 35 A"),
+              "AT": (24, "3 × 35 A"), "NL": (17, "3 × 25 A"), "GB": (23, "100 A"), "IE": (14, "63 A")}
+
+
+def run(engine: Any, hours: list, b: Any, plan: Any, end_value: float) -> list[dict[str, Any]]:
+    """The checks for the plan just made. Each: key, level (warn/info), values for the text, fix (settings) or goto."""
+    from .engine import plan_battery
+
+    out: list[dict[str, Any]] = []
+    st = engine.ov.settings
+    f = engine.ov.flow() or {}
+
+    # 1. The import limit stops the battery charging in the cheap hours.
+    if b.import_limit_kw is not None and plan is not None and hours:
+        from dataclasses import replace
+
+        free = plan_battery(hours, f["soc"], replace(b, import_limit_kw=None), end_value=end_value)
+        lost = round(plan.cost - free.cost, 2)
+        if lost > max(0.5, 0.02 * abs(plan.cost_without or 0)):
+            out.append({"key": "fuse_blocks", "level": "warn", "vals": {"limit": b.import_limit_kw, "x": lost},
+                        "fix": {"import_limit_kw": None}, "goto": "grid"})
+    peak = engine.grid_peak.kw() if getattr(engine, "grid_peak", None) else None
+    if b.import_limit_kw is not None and peak and peak > b.import_limit_kw * 1.05 and not any(c["key"] == "fuse_blocks" for c in out):
+        out.append({"key": "fuse_low", "level": "warn", "vals": {"limit": b.import_limit_kw, "peak": round(peak, 1)},
+                    "fix": {"import_limit_kw": None}, "goto": "grid"})
+    # The limit is still the 10 kW new installs start with: the usual main fuse in the country is a better guess.
+    st0 = engine.ov.settings
+    country = str(((getattr(engine, "ha", None) and engine.ha.config) or {}).get("country") or "").upper()
+    usual = USUAL_FUSE.get(country)
+    if (usual and st0.get("import_limit_kw") == 10 and not st0.get("fuse_ok") and (peak or 0) <= usual[0]
+            and not any(c["key"] in ("fuse_blocks", "fuse_low") for c in out)):
+        out.append({"key": "fuse_default", "level": "info", "vals": {"kw": usual[0], "fuse": usual[1]},
+                    "fix": {"import_limit_kw": usual[0]}, "dismiss": {"fuse_ok": True}, "goto": "grid"})
+
+    # 2. Battery size: the usable kWh it has measured differs from what's set.
+    from . import batteries
+
+    learned = engine.batt_learn.capacity()
+    if learned and not batteries.extras(st) and st.get("battery_kwh") and abs(float(st["battery_kwh"]) - learned) / learned > 0.05:
+        out.append({"key": "capacity", "level": "info", "vals": {"set": float(st["battery_kwh"]), "learned": round(learned, 1)},
+                    "fix": {"battery_kwh": None}, "goto": "battery"})
+
+    # 3. Is the car part of the house use? The user's choice says otherwise than what it has seen.
+    chosen, seen = st.get("ev_in_house"), engine.ev_detected
+    if chosen is not None and seen is not None and bool(chosen) != bool(seen):
+        out.append({"key": "ev_house", "level": "info", "vals": {"seen": bool(seen)}, "fix": {"ev_in_house": None}, "goto": "car"})
+
+    # 3b. Sell the sun instead of storing it - offered to those who had Energy Pilot before it came (new installs
+    #     have it on). Only when the plan does sell surplus sun while the battery would take it anyway.
+    st_keys = engine.ov.settings
+    ctl = getattr(engine.ov, "controller", None)
+    sell_sun = getattr(engine.ov, "sell_sun", None)
+    if callable(sell_sun) and "sell_sun" not in st_keys and not sell_sun() and plan is not None and ctl and ctl.can_block_sun():
+        kwh = sum(-s.grid_kwh for s in plan.steps if s.action == "hold" and s.grid_kwh < -0.01 and s.soc_end < b.max_soc - 1)
+        if kwh >= 1:
+            out.append({"key": "sell_sun", "level": "info", "vals": {"kwh": round(kwh, 1)}, "fix": {"sell_sun": True}, "goto": "battery"})
+
+    # 4. Selling from the battery.
+    if st.get("battery_export"):
+        if not b.export:
+            out.append({"key": "export_blocked", "level": "info", "vals": {}, "goto": "battery"})
+        elif not st.get("sell") and not engine.ov.role("sell_price"):
+            out.append({"key": "export_no_price", "level": "warn", "vals": {}, "fix": {"sell": True}, "goto": "prio"})
+        elif plan is not None and hours and not any(s.action == "export" for s in plan.steps):
+            best = max(h.sell for h in hours)
+            # What the power in the battery saves: the cheapest hour the plan lets the battery cover the house in.
+            price = {h.start: h.price for h in hours}
+            used = [price[x.start] for x in plan.steps if x.action == "discharge" and x.start in price]
+            buys = sorted(h.price for h in hours)
+            worth = min(used) if used else buys[len(buys) // 2]  # kept for later: about a usual hour's price
+            if best < worth:  # otherwise something else holds it back - nothing plain to say
+                out.append({"key": "export_no_gain", "level": "info", "vals": {"sell": round(best, 2), "worth": round(worth, 2)}})
+
+    # 5. Another battery in Home Assistant that isn't set up.
+    main = engine.ov.role("battery_soc")
+    if main and not st.get("offgrid"):
+        more = batteries.extras(st)
+        taken = [b.get("soc") for b in more] + [b.get("power") for b in more]
+        for cand in batteries.find(engine.ha.states, main, taken, list(st.get("battery_dismissed") or []),
+                                    getattr(getattr(engine.ov, "controller", None), "phones", None) or frozenset())[:1]:
+            new = {"name": cand["name"], "soc": cand["soc"], "power": cand["power"]}
+            out.append({"key": "battery_found", "level": "info", "vals": {"name": cand["name"]},
+                        "fix": {"batteries": list(st.get("batteries") or []) + [new]},
+                        "dismiss": {"battery_dismissed": list(st.get("battery_dismissed") or []) + [cand["soc"]]}, "goto": "battery"})
+
+    # 6. The learning models can't run on this CPU (see mlcheck.py) - the simple forecasts are used.
+    from . import mlcheck
+
+    if mlcheck.why() == "cpu":
+        out.append({"key": "ml_cpu", "level": "info", "vals": {}})
+
+    # 7. Another charger in Home Assistant that isn't set up.
+    from . import chargers
+
+    if engine.ov.role("ev_power") or engine.ov.role("ev_plug"):
+        more = chargers.extras(st)
+        taken = [x for c in more for x in (c.get("power"), c.get("plug"))]
+        for cand in chargers.find(engine.ha.states, engine.ov.role("ev_power"), engine.ov.role("ev_plug"), taken,
+                                  list(st.get("charger_dismissed") or []))[:1]:
+            new = {k: cand[k] for k in ("name", "power", "plug", "session")}
+            out.append({"key": "charger_found", "level": "info", "vals": {"name": cand["name"]},
+                        "fix": {"chargers": list(st.get("chargers") or []) + [new]},
+                        "dismiss": {"charger_dismissed": list(st.get("charger_dismissed") or []) + [cand["power"]]}, "goto": "car"})
+
+    # 6b. A machine or a small battery that could run cheaply (Settings → Things that run cheaply) - one at a time.
+    ctl = getattr(engine.ov, "controller", None)
+    for cand in (getattr(ctl, "thing_candidates", None) or [])[:1]:
+        import uuid
+
+        new = {"id": uuid.uuid4().hex[:8], "mode": "sun_cheap"} | {k: v for k, v in cand.items() if k not in ("device", "remote") and v}
+        out.append({"key": "thing_found", "level": "info", "vals": {"name": cand["name"]},
+                    "fix": {"things": list(st.get("things") or []) + [new]},
+                    "dismiss": {"things_dismissed": list(st.get("things_dismissed") or []) + [cand["device"]]}, "goto": "things"})
+
+    # 7. Things it can't see.
+    if f.get("soc") is None and not st.get("offgrid"):
+        out.append({"key": "no_soc", "level": "warn", "vals": {}, "goto": "roles"})
+
+    out += house_history(engine, st)
+    out += read_only(engine, st)
+    out += alpha_period(engine)
+    out += inverter_floor(engine, b)
+    return out
+
+
+# Integrations that can only read the battery - and the one that can control it instead (with a link that opens it).
+READ_ONLY = {
+    "powerwall": ("Powerwall", "Teslemetry", "https://my.home-assistant.io/redirect/config_flow_start/?domain=teslemetry"),
+    "solaredge": ("SolarEdge", "SolarEdge Modbus Multi",
+                  "https://my.home-assistant.io/redirect/hacs_repository/?owner=WillCodeForCats&repository=solaredge-modbus-multi&category=integration"),
+    "fusion_solar": ("Huawei", "Huawei Solar", "https://my.home-assistant.io/redirect/hacs_repository/?owner=wlcrs&repository=huawei_solar&category=integration"),
+}
+
+
+def read_only(engine: Any, st: dict[str, Any]) -> list[dict[str, Any]]:
+    """The battery comes from an integration that can only read it, and nothing else to control it with: one quiet line
+    that says which integration can - with a button that opens it, and "Not now" that hides it for good."""
+    ctl = getattr(engine.ov, "controller", None)
+    reg = getattr(ctl, "_ent_reg", None) or {}
+    soc = engine.ov.role("battery_soc")
+    plat = (reg.get(soc or "") or {}).get("platform")
+    if plat not in READ_ONLY or plat in (st.get("readonly_dismissed") or []):
+        return []
+    if ctl and (ctl.profile_key("battery") or st.get("custom_profile")):
+        return []  # something to control it with was found (or set up by hand): nothing to say
+    name, use, link = READ_ONLY[plat]
+    return [{"key": "read_only", "level": "info", "vals": {"name": name, "use": use}, "link": link,
+             "dismiss": {"readonly_dismissed": list(st.get("readonly_dismissed") or []) + [plat]}}]
+
+
+# AlphaESS' integration only changes a period that exists, on the weekdays it already runs: one made in its app fixes it.
+ALPHA_PERIOD = re.compile(r"no existing period|create it in the alpha|does not run today|in the alphaess app", re.I)
+
+
+def alpha_period(engine: Any) -> list[dict[str, Any]]:
+    """The last battery command was refused by AlphaESS for want of a period in its app: say how to make one."""
+    ctl = getattr(engine.ov, "controller", None)
+    log = list((getattr(ctl, "log", None) or {}).get("battery") or [])
+    last = next((e for e in log if e.get("mode") == "control"), None)
+    if not last or last.get("result") == "ok" or not ALPHA_PERIOD.search(str(last.get("error") or "")):
+        return []
+    return [{"key": "alpha_period", "level": "warn", "vals": {}}]
+
+
+def house_history(engine: Any, st: dict[str, Any]) -> list[dict[str, Any]]:
+    """The house sensor keeps no statistics in Home Assistant (no state_class): no history to learn the house from.
+    Energy Pilot can keep the history itself - offered with one tap; once on, how many days it has so far."""
+    stats_h = getattr(engine, "house_stats_hours", None)
+    house_e = engine.ov.role("house_power") or engine.ov.role("grid_power")
+    if stats_h is not None and stats_h < 24 * 7 and house_e:
+        attrs = ((engine.ha.states.get(house_e) or {}).get("attributes") or {})
+        if not st.get("own_history") and not attrs.get("state_class"):
+            return [{"key": "house_no_stats", "level": "warn", "vals": {"sensor": attrs.get("friendly_name") or house_e},
+                        "fix": {"own_history": True}, "goto": "roles"}]
+        elif st.get("own_history") and engine.house_hist.days() < 7:
+            return [{"key": "house_own_history", "level": "info", "vals": {"d": str(engine.house_hist.days())}}]
+    return []
+
+
+# The inverter's own lowest battery level: below it the inverter won't discharge, whatever is asked (Deye's
+# "Battery Low SOC" and "Shutdown SOC", Solis' over-discharge SOC, SolaX' "Selfuse Discharge Min SOC" ...).
+FLOOR = re.compile(r"(low|shut_?down|cut_?off|over_?discharge|discharge_?min|min_?discharge|end_?of_?discharge)[a-z_]*soc|soc[a-z_]*(low|min|cut_?off|shut_?down)$", re.I)
+RESTART = re.compile(r"restart[a-z_]*soc|soc[a-z_]*restart", re.I)
+NOT_FLOOR = re.compile(r"program_|time_point|energ(i|y)_?pilot|charg(e|ing)_(soc|start)|max", re.I)
+
+
+def inverter_floors(states: dict[str, Any], entities: list[str], restart: bool = False) -> list[tuple[str, float]]:
+    """(name, %) of the inverter's settings that keep the battery from going lower; restart: also the level it waits
+    for after it has been empty (Deye's "Restart SOC")."""
+    out = []
+    for e in entities:
+        if not e.startswith("number."):
+            continue
+        name = e.split(".", 1)[1]
+        if NOT_FLOOR.search(name) or not (FLOOR.search(name) or restart and RESTART.search(name)):
+            continue
+        st = states.get(e) or {}
+        unit = (st.get("attributes") or {}).get("unit_of_measurement")
+        try:
+            v = float(st.get("state"))
+        except (TypeError, ValueError):
+            continue
+        if unit in (None, "%") and 0 < v <= 100:
+            out.append((name, v))
+    return out
+
+
+def inverter_floor(engine: Any, b: Any) -> list[dict[str, Any]]:
+    """The inverter stops discharging above the minimum Energy Pilot plans with: offer to use the inverter's level."""
+    ctl = getattr(engine.ov, "controller", None)
+    if ctl is None or b is None or ctl.mode("battery") != "control":
+        return []
+    floors = inverter_floors(engine.ov.ha.states, (getattr(ctl, "entities", None) or {}).get("battery") or [])
+    if not floors:
+        return []
+    name, v = max(floors, key=lambda x: x[1])
+    if v <= (b.min_soc or 0) + 0.5:
+        return []
+    return [{"key": "inv_floor", "level": "warn", "vals": {"inv": int(v) if float(v).is_integer() else v, "ep": int(b.min_soc or 0), "name": name},
+             "fix": {"battery_min_soc": int(round(v))}, "goto": "battery"}]
+
+
+class FollowWatch:
+    """Does the battery do what it's told? If the plan wants it to cover the house (or charge) and it stays at 0 W for
+    10 minutes, something on the inverter holds it back - often a rate or limit left at 0 by another system. It says
+    so, with the inverter's settings that stand at 0, so it's found for every inverter, known or not."""
+
+    WAIT = 600  # seconds the battery must stay still before it's told
+    WORDS = {"discharge": r"discharg|dischg|output|export", "charge": r"(?<!dis)charg|(?<!dis)chg|input"}
+    LIMIT = r"rate|power|limit|current|level|max"
+
+    def __init__(self) -> None:
+        self.since: datetime | None = None
+        self.kind: str | None = None
+        self.found: dict[str, Any] | None = None
+
+    def see(self, now: datetime, mode: str | None, want: dict[str, Any] | None, f: dict[str, Any],
+            states: dict[str, Any], entities: list[str]) -> None:
+        kind = self._expect(mode, want, f)
+        batt, grid = f.get("battery"), f.get("grid") or 0.0
+        stuck = kind == "discharge" and batt is not None and batt > -100 and grid > 300 \
+            or kind == "charge" and batt is not None and batt < 100
+        if not stuck:
+            self.since, self.kind, self.found = None, None, None
+            return
+        if self.kind != kind:
+            self.since, self.kind, self.found = now, kind, None
+        if (now - self.since).total_seconds() >= self.WAIT and self.found is None:
+            self.found = {"kind": kind, "at": now.isoformat(), "suspects": self.suspects(kind, states, entities, f.get("soc"))}
+            import logging
+
+            logging.getLogger("energy_pilot.control").warning("The battery doesn't follow the plan (%s): %s", kind, self.found["suspects"])
+
+    @staticmethod
+    def _expect(mode: str | None, want: dict[str, Any] | None, f: dict[str, Any]) -> str | None:
+        if mode != "control" or not want or f.get("soc") is None:
+            return None
+        ctx, soc = want.get("ctx") or {}, f["soc"]
+        need = (f.get("house") or 0.0) - (f.get("pv") or 0.0)
+        if want.get("intent") == "normal" and need > 400 and soc > (ctx.get("min_soc") or 0) + 3:
+            return "discharge"
+        if want.get("intent") == "charge" and soc < (ctx.get("target") or 0) - 3:
+            return "charge"
+        return None
+
+    @classmethod
+    def suspects(cls, kind: str, states: dict[str, Any], entities: list[str], soc: float | None = None) -> list[str]:
+        """The inverter's numbers that sound like they limit this way and stand at 0 or at their lowest (Sungrow's
+        "no battery discharge" is 10 W, the least it takes): "free_mode_discharge_rate = 0"."""
+        import re
+
+        out = []
+        # The inverter's own lowest level (or the level it waits for after empty) at or above the battery now.
+        if kind == "discharge" and soc is not None:
+            out += [f"{n} = {int(v) if v.is_integer() else v} %" for n, v in inverter_floors(states, entities, restart=True) if v >= soc - 1]
+        for e in entities:
+            if not e.startswith("number."):
+                continue
+            name = e.split(".", 1)[1]
+            if not (re.search(cls.WORDS[kind], name) and re.search(cls.LIMIT, name)):
+                continue
+            st = states.get(e) or {}
+            try:
+                v = float(st.get("state"))
+            except (TypeError, ValueError):
+                continue
+            attrs = st.get("attributes") or {}
+            lo, hi = attrs.get("min"), attrs.get("max")
+            lowest = isinstance(lo, (int, float)) and isinstance(hi, (int, float)) and 0 < lo and hi >= 20 * lo and v <= lo
+            if v == 0 or lowest:
+                out.append(f"{name} = {int(v) if v.is_integer() else v}")
+        # Modes and switches that stop it outright: Victron's "Keep batteries charged", GivEnergy's pause, "disable charge".
+        block = {"discharge": r"keep batteries charged|pause discharg|pause both", "charge": r"pause charg|pause both"}[kind]
+        for e in entities:
+            st = str((states.get(e) or {}).get("state") or "")
+            name = e.split(".", 1)[1]
+            if e.startswith("select.") and re.search(block, st, re.I):
+                out.append(f"{name} = {st}")
+            elif e.startswith("switch.") and st == "on" and re.search(r"disable_charg" if kind == "charge" else r"disable_discharg", name):
+                out.append(f"{name} = on")
+        return out[:4]
+
+    def check(self) -> list[dict[str, Any]]:
+        if not self.found:
+            return []
+        names = ", ".join(self.found["suspects"])
+        key = f"follow_{self.found['kind']}" + ("_why" if names else "")
+        return [{"key": key, "level": "warn", "vals": {"list": names}, "goto": "battery"}]
