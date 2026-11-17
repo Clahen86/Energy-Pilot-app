@@ -22,7 +22,7 @@
     } catch (e2) { /* lad være */ }
   }
 
-  const PYODIDE_VERSIONS = ['v0.29.0', 'v0.28.3', 'v0.28.0', 'v0.27.7'];
+  const PYODIDE_VERSIONS = ['v314.0.8', 'v0.29.0', 'v0.28.3', 'v0.28.0', 'v0.27.7'];
   // Forbindelser gemmes på enheden (skærmen "Forbindelser", knappen 🔌 øverst til venstre).
   function loadConn() { try { return JSON.parse(localStorage.getItem('ep_app_conn') || '{}'); } catch (e) { return {}; } }
   function saveConn(c) { try { localStorage.setItem('ep_app_conn', JSON.stringify(c)); } catch (e) { /* */ } }
