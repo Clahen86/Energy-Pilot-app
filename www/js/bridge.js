@@ -23,7 +23,21 @@
   }
 
   const PYODIDE_VERSIONS = ['v0.29.0', 'v0.28.3', 'v0.28.0', 'v0.27.7'];
-  const MODE = (new URLSearchParams(location.search).get('mode')) || 'demo';
+  // Forbindelser gemmes på enheden (skærmen "Forbindelser", knappen 🔌 øverst til venstre).
+  function loadConn() { try { return JSON.parse(localStorage.getItem('ep_app_conn') || '{}'); } catch (e) { return {}; } }
+  function saveConn(c) { try { localStorage.setItem('ep_app_conn', JSON.stringify(c)); } catch (e) { /* */ } }
+  const CONN = loadConn();
+  const MODE = (new URLSearchParams(location.search).get('mode')) || CONN.mode || 'demo';
+  const NATIVE = !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
+
+  // UDP (KEBA) går gennem appens eget native plugin; en browser kan ikke sende UDP.
+  window.EPNative = {
+    udp: NATIVE && !!(window.Capacitor.Plugins && window.Capacitor.Plugins.EpUdp),
+    udpRequest: async function (host, port, message, timeoutMs, localPort, expectReply) {
+      const r = await window.Capacitor.Plugins.EpUdp.request({ host, port, message, timeoutMs, localPort, expectReply });
+      return r && r.reply != null ? r.reply : null;
+    },
+  };
   // Udvikling: ?dev=1 springer Pyodide over og bruger tools/dev_server.py (samme kerne i almindelig Python).
   const DEV = new URLSearchParams(location.search).get('dev') === '1';
   const realFetch = window.fetch.bind(window);
@@ -91,8 +105,9 @@
           const head = await realFetch('pyodide/pyodide.js', { method: 'HEAD' }).catch(() => null);
           if (!head || !head.ok) continue;
         }
-        await loadScript(base + 'pyodide.js');
-        return await window.loadPyodide({ indexURL: base });
+        const url = new URL(base, location.href).href;
+        await loadScript(url + 'pyodide.js');
+        return await window.loadPyodide({ indexURL: url });
       } catch (e) { lastErr = e; }
     }
     throw lastErr || new Error('Pyodide kunne ikke hentes');
@@ -131,7 +146,8 @@
     step('Starter motoren…', 85);
     py.runPython("import sys\nsys.path.insert(0, '/app')\nfrom standalone import boot\n");
     boot = py.globals.get('boot');
-    boot.start(MODE, JSON.stringify({ language: (navigator.language || 'da').slice(0, 2) }));
+    const cfg = Object.assign({ language: (navigator.language || 'da').slice(0, 2) }, MODE === 'home' ? CONN : {});
+    boot.start(MODE, JSON.stringify(cfg));
     window.EP_PY = py;
     window.EP_BOOT = boot;
 
@@ -145,9 +161,110 @@
     if (MODE === 'demo') {
       const tag = document.createElement('div');
       tag.id = 'ep-demo';
-      tag.textContent = 'DEMO · simuleret Growatt + KEBA';
+      tag.textContent = 'DEMO · simuleret SolarAssistant + KEBA';
       document.body.appendChild(tag);
     }
+    addConnButton();
+  }
+
+  // ---------- Forbindelser (kun i appen – ikke en del af panelet fra Home Assistant) ----------
+  const esc = (t) => String(t == null ? '' : t).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+  function addConnButton() {
+    const css = document.createElement('style');
+    css.textContent =
+      '#ep-conn-btn{position:fixed;right:12px;bottom:calc(env(safe-area-inset-bottom) + 112px);z-index:60;width:34px;height:34px;border-radius:50%;border:1px solid rgba(255,255,255,.12);' +
+      'background:rgba(13,17,24,.85);color:#f3f5f9;font-size:16px;line-height:32px;text-align:center;cursor:pointer;backdrop-filter:blur(6px)}' +
+      '#ep-conn{position:fixed;inset:0;z-index:9998;background:rgba(0,0,0,.55);display:flex;align-items:flex-end;justify-content:center}' +
+      '#ep-conn .box{background:#0d1118;color:#f3f5f9;width:100%;max-width:560px;max-height:92vh;overflow:auto;border-radius:18px 18px 0 0;' +
+      'padding:18px 18px calc(18px + env(safe-area-inset-bottom));font:14px -apple-system,system-ui,sans-serif}' +
+      '#ep-conn h2{margin:0 0 4px;font-size:19px}#ep-conn h3{margin:18px 0 6px;font-size:14px;color:#a99dff}' +
+      '#ep-conn label{display:block;margin:8px 0;color:#8b93a3;font-size:12px}#ep-conn input,#ep-conn select{display:block;width:100%;box-sizing:border-box;margin-top:4px;' +
+      'background:#131924;color:#f3f5f9;border:1px solid rgba(255,255,255,.12);border-radius:10px;padding:10px;font-size:15px}' +
+      '#ep-conn .row{display:flex;gap:8px;margin-top:14px}#ep-conn button{flex:1;padding:12px;border-radius:12px;border:1px solid rgba(255,255,255,.12);' +
+      'background:#131924;color:#f3f5f9;font-weight:600;font-size:15px}#ep-conn button.pri{background:#7c6cff;border-color:#7c6cff}' +
+      '#ep-conn .muted{color:#8b93a3;font-size:12px}#ep-conn .ok{color:#3ddc97}#ep-conn .bad{color:#ff5d6c}#ep-conn .warn{color:#f5b544}' +
+      '#ep-conn table{width:100%;border-collapse:collapse;font-size:12px}#ep-conn td{padding:4px 2px;border-top:1px solid rgba(255,255,255,.06);vertical-align:top;word-break:break-all}' +
+      '#ep-conn details{margin-top:8px}#ep-conn summary{cursor:pointer;color:#c9cfdb}';
+    document.head.appendChild(css);
+    const b = document.createElement('button');
+    b.id = 'ep-conn-btn';
+    b.type = 'button';
+    b.title = 'Forbindelser';
+    b.textContent = '🔌';
+    b.onclick = openConn;
+    document.body.appendChild(b);
+  }
+
+  function openConn() {
+    const c = loadConn();
+    const sa = c.solarassistant || {};
+    const kb = c.keba || {};
+    const wrap = document.createElement('div');
+    wrap.id = 'ep-conn';
+    const httpsNote = (!NATIVE && location.protocol === 'https:')
+      ? '<p class="warn">Du kører i en browser. Forbindelse til SolarAssistant og KEBA på dit hjemmenetværk kræver Android-appen.</p>' : '';
+    wrap.innerHTML =
+      '<div class="box"><h2>Forbindelser</h2><div class="muted">Hvor Energipilot henter data og styrer fra. Gemmes kun på denne enhed.</div>' + httpsNote +
+      '<label>Kør som<select id="c-mode"><option value="demo">Demo – simuleret hus</option><option value="home">Mit hjem – mine egne enheder</option></select></label>' +
+      '<h3>Inverter via SolarAssistant</h3>' +
+      '<label>Adresse (IP)<input id="c-sa-host" placeholder="192.168.1.20" value="' + esc(sa.host) + '"></label>' +
+      '<label>Lokal adgangskode (SolarAssistant → Configuration)<input id="c-sa-pw" type="password" value="' + esc(sa.password) + '"></label>' +
+      '<label>Navn som i Home Assistant<input id="c-sa-name" placeholder="Growatt SPH" value="' + esc(sa.name || 'Growatt SPH') + '"></label>' +
+      '<label>Model<input id="c-sa-model" placeholder="SPH 3600" value="' + esc(sa.model || 'SPH 3600') + '"></label>' +
+      '<h3>Elbil-lader (KEBA)</h3>' +
+      '<label>Adresse (IP)<input id="c-kb-host" placeholder="192.168.1.30" value="' + esc(kb.host) + '"></label>' +
+      '<div class="row"><button type="button" id="c-cancel">Luk</button><button type="button" class="pri" id="c-save">Gem og genstart</button></div>' +
+      '<h3>Status</h3><div id="c-status" class="muted">Henter…</div></div>';
+    document.body.appendChild(wrap);
+    wrap.querySelector('#c-mode').value = MODE;
+    wrap.onclick = (e) => { if (e.target === wrap) close(); };
+    wrap.querySelector('#c-cancel').onclick = close;
+    wrap.querySelector('#c-save').onclick = () => {
+      const v = (id) => wrap.querySelector(id).value.trim();
+      const n = loadConn();
+      n.mode = v('#c-mode');
+      n.solarassistant = Object.assign({}, n.solarassistant || {}, { host: v('#c-sa-host'), password: wrap.querySelector('#c-sa-pw').value,
+        name: v('#c-sa-name') || 'Growatt SPH', model: v('#c-sa-model') || 'SPH 3600' });
+      n.keba = Object.assign({}, n.keba || {}, { host: v('#c-kb-host') });
+      saveConn(n);
+      const u = new URL(location.href);
+      u.searchParams.delete('mode');
+      try { boot && boot.save(); } catch (e) { /* */ }
+      location.replace(u.toString());
+    };
+    let timer = null;
+    function close() { clearInterval(timer); wrap.remove(); }
+    async function status() {
+      let info;
+      try { info = boot ? JSON.parse(boot.info()) : await (await realFetch('/__info')).json(); } catch (e) { return; }
+      const el = wrap.querySelector('#c-status');
+      if (!el) return;
+      let h = '';
+      for (const d of info.devices || []) {
+        const ok = d.status === 'forbundet' || (d.online && !d.status);
+        h += '<div><b>' + esc(d.name) + '</b> · <span class="' + (ok ? 'ok' : 'bad') + '">' + esc(d.status || (d.online ? 'ok' : 'offline')) + '</span>' +
+          (d.host ? ' <span class="muted">(' + esc(d.host) + ')</span>' : '') + '</div>';
+        if (d.missing && d.missing.length) {
+          h += '<div class="warn">Indstillinger SolarAssistant ikke har meldt: ' + d.missing.map(esc).join(', ') + '</div>';
+        }
+        if (d.topics && d.topics.length) {
+          h += '<details><summary>' + d.topics.length + ' emner fra SolarAssistant</summary><table>' +
+            d.topics.map((t) => '<tr><td>' + esc(t.topic) + '</td><td>' + esc(t.value) + ' ' + esc(t.unit || '') + '</td><td class="muted">' + esc(t.entity || '') + '</td></tr>').join('') +
+            '</table></details>';
+        }
+      }
+      if (!(info.devices || []).length) h += '<div class="warn">Ingen enheder. Udfyld adresserne ovenfor og vælg "Mit hjem".</div>';
+      const sv = (info.services || []).slice(-8).reverse();
+      if (sv.length) {
+        h += '<details><summary>Seneste kommandoer</summary><table>' + sv.map((s) => '<tr><td>' + esc(s.t.slice(11, 19)) + '</td><td>' + esc(s.domain + '.' + s.service) +
+          '</td><td class="muted">' + esc((s.entity_id || []).join(', ') + ' ' + JSON.stringify(s.data || {})) + '</td></tr>').join('') + '</table></details>';
+      }
+      h += '<details><summary>Log</summary><table>' + (info.log || []).slice(-25).reverse().map((l) => '<tr><td>' + esc(l) + '</td></tr>').join('') + '</table></details>';
+      el.innerHTML = h;
+    }
+    status();
+    timer = setInterval(status, 3000);
   }
 
   // ---------- Panelets API-kald går til Python ----------
@@ -184,7 +301,8 @@
 
   if (DEV) {
     window.fetch = realFetch;
-    if (document.body) overlay.remove(); else document.addEventListener('DOMContentLoaded', () => overlay.remove());
+    const devReady = () => { overlay.remove(); addConnButton(); };
+    if (document.body) devReady(); else document.addEventListener('DOMContentLoaded', devReady);
   } else {
     start().catch(fail);
   }

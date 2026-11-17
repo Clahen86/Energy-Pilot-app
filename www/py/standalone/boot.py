@@ -61,24 +61,49 @@ def _install(devices: list[Any], config: dict[str, Any] | None) -> None:
 
 
 def start(mode: str = "demo", config_json: str = "{}") -> None:
-    """mode "demo": a simulated home. Later: "devices" with the user's own drivers."""
+    """mode "demo": a simulated home reached through the real drivers.
+    mode "home": the user's own devices from config_json, e.g.
+      {"solarassistant": {"host": "192.168.1.20", "password": "…", "name": "Growatt SPH", "model": "SPH 3600"},
+       "keba": {"host": "192.168.1.30", "name": "KEBA P30"}}"""
     global _task
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     logging.getLogger().addHandler(_Collect())
     DATA.mkdir(parents=True, exist_ok=True)
     config = json.loads(config_json or "{}")
     if mode == "demo":
-        from standalone.devices.demo import make_demo, seed_history
+        from standalone.devices.demo import seed_history
+        from standalone.devices.simulators import make_simulated_home
 
-        devices, world = make_demo()
-        _install(devices, config)
+        devices, world = make_simulated_home()
+        _install(devices, {k: v for k, v in config.items() if k in ("language",)})
         seed_history(_ha, world)
         _seed_settings()
+    elif mode == "home":
+        devices = make_devices(config)
+        _install(devices, {k: v for k, v in config.items() if k in ("language", "latitude", "longitude")})
     else:
         raise ValueError(f"unknown mode {mode}")
     import energy_pilot.main as main_mod
 
     _task = asyncio.ensure_future(main_mod.main())
+
+
+def make_devices(config: dict[str, Any]) -> list[Any]:
+    """The user's own devices from the connection screen."""
+    devices: list[Any] = []
+    sa = config.get("solarassistant") or {}
+    if sa.get("host"):
+        from standalone.devices.solarassistant import SolarAssistant
+
+        devices.append(SolarAssistant(sa["host"], sa.get("password", ""), family=sa.get("family", "growatt_sph"),
+                                      name=sa.get("name") or "Growatt SPH", model=sa.get("model") or "SPH 3600",
+                                      manufacturer=sa.get("manufacturer") or "Growatt", mapping=sa.get("map")))
+    kb = config.get("keba") or {}
+    if kb.get("host"):
+        from standalone.devices.keba import Keba
+
+        devices.append(Keba(kb["host"], name=kb.get("name") or "KEBA P30"))
+    return devices
 
 
 def _seed_settings() -> None:
@@ -116,13 +141,24 @@ async def handle(method: str, path: str, query_json: str = "{}", body: str = "")
 
 
 def info() -> str:
-    """For the app's own status line: what the devices were last told, and the log."""
+    """For the app's connection screen: each device's status (and SolarAssistant's topics), what the devices were
+    last told, and the log."""
+    devs = []
+    for d in (_ha.devices if _ha else []):
+        x = {"name": d.name, "platform": d.platform, "online": d.online, "entities": len(d.entities)}
+        if hasattr(d, "info"):
+            try:
+                x.update(d.info())
+            except Exception:  # noqa: BLE001
+                pass
+        devs.append(x)
     return json.dumps({
         "ready": ready(),
         "entities": len(_ha.states) if _ha else 0,
-        "services": (_ha.service_log[-20:] if _ha else []),
-        "log": LOG[-60:],
-    })
+        "devices": devs,
+        "services": (_ha.service_log[-30:] if _ha else []),
+        "log": LOG[-80:],
+    }, default=str)
 
 
 def save() -> None:

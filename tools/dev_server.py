@@ -1,7 +1,9 @@
 """Run the app on a normal computer without Pyodide: the same Python core (standalone/boot.py) behind a small web
 server. Open http://localhost:8099/?dev=1 - quick for developing the core and the panel.
 
-    python3 tools/dev_server.py            (needs numpy and scikit-learn)
+    python3 tools/dev_server.py            demo (needs numpy and scikit-learn)
+    EP_MODE=home EP_CONFIG='{"solarassistant": {"host": "192.168.1.20", "password": "…"}, "keba": {"host": "192.168.1.30"}}' \
+        python3 tools/dev_server.py        your own devices, from a computer on your home network
 """
 import asyncio
 import http.server
@@ -22,7 +24,7 @@ loop = asyncio.new_event_loop()
 
 def run_loop() -> None:
     asyncio.set_event_loop(loop)
-    boot.start(os.environ.get("EP_MODE", "demo"))
+    boot.start(os.environ.get("EP_MODE", "demo"), os.environ.get("EP_CONFIG", "{}"))
     loop.run_forever()
 
 
@@ -46,6 +48,13 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         return True
 
     def do_GET(self):  # noqa: N802
+        if self.path.startswith("/__info"):
+            data = boot.info().encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if not self._api("GET"):
             super().do_GET()
 

@@ -1,0 +1,51 @@
+# Keeps the app's core in step with the Home Assistant app: copies the newest Energy Pilot core, runs the tests,
+# and if they pass, commits it and builds a new Android app. Never writes to the Home Assistant app's repo.
+name: Hent ny kerne fra Home Assistant-appen
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: Clahen86/Energy-pilot
+          path: ha-core
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Kopiér kernen
+        run: |
+          python tools/sync_core.py ha-core
+          rm -rf ha-core
+          if git diff --quiet; then echo "CHANGED=no" >> "$GITHUB_ENV"; else echo "CHANGED=yes" >> "$GITHUB_ENV"; fi
+
+      - name: Test med den nye kerne
+        if: env.CHANGED == 'yes'
+        run: |
+          pip install numpy scikit-learn
+          python -m unittest discover tests
+
+      - name: Gem og byg ny app
+        if: env.CHANGED == 'yes'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=$(python -c "import json;print(json.load(open('CORE_SOURCE.json'))['version'])")
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Energy Pilot-kerne ${VERSION} fra Home Assistant-appen"
+          git push
+          gh workflow run android.yml --ref main

@@ -166,7 +166,10 @@ class VirtualHA:
         for d in self.devices:
             d.attach(self)
         for d in self.devices:
-            await d.refresh(0.0)
+            try:
+                await d.refresh(0.0)
+            except Exception:  # noqa: BLE001 - a device that can't be reached must not stop the app
+                _LOGGER.warning("Device %s could not be read", d.name, exc_info=True)
         self.connected.set()
         _LOGGER.info("Virtual Home Assistant ready (%s entities, %s devices)", len(self.states), len(self.devices))
         saved = time.time()
