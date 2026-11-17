@@ -16,19 +16,41 @@ OUT = Path(__file__).resolve().parent.parent / "www" / "pyodide"
 WANT = ["numpy", "scikit-learn", "tzdata"]
 
 
+KNOWN = ["0.29.0", "0.28.3", "0.28.2", "0.28.1", "0.28.0", "0.27.7"]  # tried in order if the newest can't be looked up
+
+
 def get(url: str) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": "energipilot-build"})
+    headers = {"User-Agent": "energipilot-build"}
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if token and url.startswith("https://api.github.com/"):
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=300) as r:  # noqa: S310
         return r.read()
 
 
-version = os.environ.get("PYODIDE_VERSION") or json.loads(get("https://api.github.com/repos/pyodide/pyodide/releases/latest"))["tag_name"]
-version = version.lstrip("v")
+candidates = [os.environ["PYODIDE_VERSION"]] if os.environ.get("PYODIDE_VERSION") else []
+if not candidates:
+    try:
+        candidates.append(json.loads(get("https://api.github.com/repos/pyodide/pyodide/releases/latest"))["tag_name"])
+    except Exception as err:  # noqa: BLE001
+        print("kunne ikke slå nyeste Pyodide op:", err)
+    candidates += KNOWN
+core, version = None, ""
+for v in candidates:
+    v = v.lstrip("v")
+    try:
+        core = get(f"https://github.com/pyodide/pyodide/releases/download/{v}/pyodide-core-{v}.tar.bz2")
+        version = v
+        break
+    except Exception as err:  # noqa: BLE001
+        print(f"Pyodide {v}: {err}")
+if core is None:
+    sys.exit("Pyodide kunne ikke hentes")
 print("Pyodide", version)
 if OUT.exists():
     shutil.rmtree(OUT)
 OUT.mkdir(parents=True)
-core = get(f"https://github.com/pyodide/pyodide/releases/download/{version}/pyodide-core-{version}.tar.bz2")
 with tarfile.open(fileobj=io.BytesIO(core), mode="r:bz2") as tar:
     for m in tar.getmembers():
         if not m.isfile():

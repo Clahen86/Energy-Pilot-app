@@ -45,6 +45,8 @@ jobs:
           java-version: 21
 
       - name: Python til appen (Pyodide)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: python tools/fetch_pyodide.py
 
       - name: Android-projekt
