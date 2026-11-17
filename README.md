@@ -90,7 +90,8 @@ www/index.html            startside: kører den nyeste version (indbygget eller 
 www/app.html              panelet + bro (bygges af tools/build_index.py)
 www/version.json          versionen, appen sammenligner med for at opdatere sig selv
 www/panel.html            panelet, uændret fra HA-appen
-www/js/bridge.js          Pyodide, API-routing, forbindelses-skærm, native UDP
+www/js/bridge.js          starter kernen, API-routing, forbindelses-skærm, opdatering
+www/js/worker.js          Python-kernen (Pyodide) i en baggrundstråd
 www/py/energy_pilot/      kernen, uændret fra HA-appen
 www/py/standalone/        virtuel Home Assistant, opstart, drivere og simulatorer
 www/py/aiohttp/           lille aiohttp-erstatning (fetch)

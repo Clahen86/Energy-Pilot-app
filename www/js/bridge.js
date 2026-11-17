@@ -1,10 +1,10 @@
 /*
  * Energipilot – broen mellem panelet og Python-kernen.
  *
- * 1. Indlæser Pyodide (Python i browseren/WebView) med numpy og scikit-learn.
- * 2. Lægger Energy Pilots Python-kode (www/py) ind i Pyodides filsystem.
- * 3. Starter energy_pilot.main() med den virtuelle Home Assistant (standalone/boot.py).
- * 4. Sender panelets kald til "api/..." direkte til web.py i Python – i stedet for over netværket.
+ * 1. Starter en baggrundstråd (js/worker.js) med Pyodide (Python), numpy og scikit-learn, så panelet ikke fryser.
+ * 2. Giver den Energy Pilots Python-kode (www/py), som starter energy_pilot.main() med den virtuelle Home Assistant.
+ * 3. Sender panelets kald til "api/..." til web.py i Python – i stedet for over netværket.
+ * 4. Udfører UDP og kald til andre servere for kernen (appens native plugin og native HTTP).
  *
  * Panelet (index.html) er det samme som i Home Assistant-appen.
  */
@@ -43,7 +43,6 @@
   const realFetch = window.fetch.bind(window);
   let resolveReady, rejectReady;
   const ready = new Promise((res, rej) => { resolveReady = res; rejectReady = rej; });
-  let boot = null;
 
   // ---------- Indlæsningsskærm ----------
   const overlay = document.createElement('div');
@@ -84,82 +83,95 @@
     rejectReady(err);
   }
 
-  // ---------- Pyodide ----------
-  function loadScript(src) {
-    return new Promise((res, rej) => {
-      const s = document.createElement('script');
-      s.src = src;
-      s.onload = () => res(src);
-      s.onerror = () => rej(new Error('kunne ikke hente ' + src));
-      document.head.appendChild(s);
+  // ---------- Python-kernen i en baggrundstråd (js/worker.js) ----------
+  let worker = null;
+  let callSeq = 0;
+  const calls = new Map();
+
+  /** Et kald til kernen: 'api' (panelets kald), 'info' (status) eller 'save'. */
+  function core(kind, args) {
+    return new Promise((resolve, reject) => {
+      if (!worker) { reject(new Error('kernen kører ikke')); return; }
+      const id = ++callSeq;
+      calls.set(id, { resolve, reject });
+      worker.postMessage({ t: 'call', id, kind, args: args || {} });
     });
   }
+  function saveCore() { if (worker) core('save').catch(() => {}); }
 
-  async function loadPyodideAnywhere() {
+  async function pyodideBases() {
     // Den native app har Pyodide med i pakken (www/pyodide/); ellers hentes den fra jsDelivr.
-    const bases = ['pyodide/'].concat(PYODIDE_VERSIONS.map((v) => 'https://cdn.jsdelivr.net/pyodide/' + v + '/full/'));
-    let lastErr;
-    for (const base of bases) {
-      try {
-        if (base === 'pyodide/') {
-          const head = await realFetch('pyodide/pyodide.js', { method: 'HEAD' }).catch(() => null);
-          if (!head || !head.ok) continue;
-        }
-        const url = new URL(base, location.href).href;
-        await loadScript(url + 'pyodide.js');
-        return await window.loadPyodide({ indexURL: url });
-      } catch (e) { lastErr = e; }
-    }
-    throw lastErr || new Error('Pyodide kunne ikke hentes');
+    const bases = [];
+    const head = await realFetch('pyodide/pyodide.js', { method: 'HEAD' }).catch(() => null);
+    if (head && head.ok) bases.push(new URL('pyodide/', location.href).href);
+    return bases.concat(PYODIDE_VERSIONS.map((v) => 'https://cdn.jsdelivr.net/pyodide/' + v + '/full/'));
   }
 
-  async function persist(py, load) {
-    try {
-      await new Promise((res, rej) => py.FS.syncfs(!!load, (err) => (err ? rej(err) : res())));
-    } catch (e) { /* ingen IndexedDB her: data holdes kun mens appen er åben */ }
+  async function makeWorker() {
+    if (!window.EP_OTA) return new Worker('js/worker.js');
+    // En version appen selv har hentet: baggrundstrådens kode ligger gemt sammen med den.
+    let src = null;
+    try { src = localStorage.getItem('ep_ota_worker'); } catch (e) { /* */ }
+    if (!src) {
+      const r = await realFetch(UPDATE_BASE + 'js/worker.js?v=' + window.EP_OTA.id, { cache: 'no-store' });
+      if (!r.ok) throw new Error('worker.js');
+      src = await r.text();
+      try { localStorage.setItem('ep_ota_worker', src); } catch (e) { /* */ }
+    }
+    return new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+  }
+
+  // Det kernen beder siden om: UDP (appens native plugin) og kald til andre servere (native HTTP i appen).
+  async function answer(kind, a) {
+    if (kind === 'udp') return await window.EPNative.udpRequest(a.host, a.port, a.message, a.timeoutMs, a.localPort, a.expectReply);
+    if (kind === 'fetch') {
+      const init = { method: a.method, headers: a.headers };
+      if (a.body != null) init.body = a.body;
+      const r = await realFetch(a.url, init);
+      const headers = {};
+      r.headers.forEach((v, k) => { headers[k] = v; });
+      return { status: r.status, headers, body: await r.arrayBuffer() };
+    }
+    throw new Error('ukendt ' + kind);
   }
 
   async function start() {
-    step('Henter Python…', 8);
-    const py = await loadPyodideAnywhere();
-    step('Henter læringsmodeller (scikit-learn)…', 35);
-    await py.loadPackage(['numpy', 'scikit-learn']);
-    try { await py.loadPackage(['tzdata']); } catch (e) { /* tidszoner findes måske allerede */ }
-
-    step('Gør plads til dine data…', 60);
-    try { py.FS.mkdir('/data'); } catch (e) { /* findes */ }
-    try { py.FS.mount(py.FS.filesystems.IDBFS, {}, '/data'); } catch (e) { /* ingen IndexedDB */ }
-    await persist(py, true);
-
-    step('Lægger Energipilot ind…', 70);
+    step('Starter…', 4);
     let bundle = null;
     if (window.EP_OTA) {  // a newer version the app fetched itself (see "Automatisk opdatering" below)
-      try { bundle = JSON.parse(localStorage.getItem('ep_ota_bundle') || 'null'); } catch (e) { bundle = null; }
+      try { bundle = localStorage.getItem('ep_ota_bundle'); } catch (e) { bundle = null; }
     }
-    if (!bundle) bundle = await (await realFetch('py/bundle.json')).json();
-    const files = Object.keys(bundle);
-    const texts = files.map((f) => bundle[f]);
-    files.forEach((f, i) => {
-      const path = '/app/' + f;
-      const dirs = path.split('/').slice(1, -1);
-      let cur = '';
-      for (const d of dirs) { cur += '/' + d; try { py.FS.mkdir(cur); } catch (e) { /* findes */ } }
-      py.FS.writeFile(path, texts[i]);
-    });
-
-    step('Starter motoren…', 85);
-    py.runPython("import sys\nsys.path.insert(0, '/app')\nfrom standalone import boot\n");
-    boot = py.globals.get('boot');
+    if (!bundle) bundle = await (await realFetch('py/bundle.json')).text();
+    try {
+      worker = await makeWorker();
+    } catch (e) {
+      if (window.EP_OTA) { location.replace('app.html'); return; }  // back to the version the app came with
+      throw e;
+    }
     const cfg = Object.assign({ language: (navigator.language || 'da').slice(0, 2) }, MODE === 'home' ? CONN : {});
-    boot.start(MODE, JSON.stringify(cfg));
-    window.EP_PY = py;
-    window.EP_BOOT = boot;
-
-    // Vent til den virtuelle Home Assistant er klar
-    for (let i = 0; i < 300 && !boot.ready(); i++) await new Promise((r) => setTimeout(r, 100));
+    await new Promise((resolve, reject) => {
+      worker.onerror = (e) => reject(new Error(e.message || 'baggrundstråden kunne ikke starte'));
+      worker.onmessage = (e) => {
+        const m = e.data || {};
+        if (m.t === 'progress') step(m.msg, m.pct);
+        else if (m.t === 'ready') resolve();
+        else if (m.t === 'fail') reject(new Error(m.err));
+        else if (m.t === 'res') {
+          const c = calls.get(m.id);
+          if (!c) return;
+          calls.delete(m.id);
+          if (m.ok) c.resolve(m.data); else c.reject(new Error(m.err));
+        } else if (m.t === 'req') {
+          answer(m.kind, m.args).then(
+            (data) => worker.postMessage({ t: 'ans', id: m.id, ok: true, data }, data && data.body instanceof ArrayBuffer ? [data.body] : []),
+            (err) => worker.postMessage({ t: 'ans', id: m.id, ok: false, err: String(err && err.message || err) }));
+        }
+      };
+      pyodideBases().then((bases) => worker.postMessage({ t: 'init', bundle, mode: MODE, config: JSON.stringify(cfg), udp: window.EPNative.udp, pyodideBases: bases }), reject);
+    });
+    bundle = null;
     step('Klar', 100);
-    setInterval(() => { try { boot.save(); } catch (e) { /* */ } persist(py, false); }, 60000);
-    document.addEventListener('visibilitychange', () => { if (document.hidden) { try { boot.save(); } catch (e) { /* */ } persist(py, false); } });
+    document.addEventListener('visibilitychange', () => { if (document.hidden) saveCore(); });
     resolveReady();
     setTimeout(() => overlay.remove(), 300);
     if (MODE === 'demo') {
@@ -236,14 +248,14 @@
       saveConn(n);
       const u = new URL(location.href);
       u.searchParams.delete('mode');
-      try { boot && boot.save(); } catch (e) { /* */ }
-      location.replace(u.toString());
+      saveCore();
+      setTimeout(() => location.replace(u.toString()), 400);
     };
     let timer = null;
     function close() { clearInterval(timer); wrap.remove(); }
     async function status() {
       let info;
-      try { info = boot ? JSON.parse(boot.info()) : await (await realFetch('/__info')).json(); } catch (e) { return; }
+      try { info = worker ? JSON.parse(await core('info')) : await (await realFetch('/__info')).json(); } catch (e) { return; }
       const el = wrap.querySelector('#c-status');
       if (!el) return;
       let h = '';
@@ -299,22 +311,23 @@
       const stored = JSON.parse(localStorage.getItem('ep_ota_meta') || 'null');
       if (!stored || stored.id !== nv.id) {
         const get = async (f) => { const x = await realFetch(UPDATE_BASE + f + '?v=' + nv.id, { cache: 'no-store' }); if (!x.ok) throw new Error(f); return x.text(); };
-        const [html, bridge, bundle] = await Promise.all([get('app.html'), get('js/bridge.js'), get('py/bundle.json')]);
+        const [html, bridge, bundle, workerSrc] = await Promise.all([get('app.html'), get('js/bridge.js'), get('py/bundle.json'), get('js/worker.js')]);
         JSON.parse(bundle);  // must be whole
         if (html.indexOf('<script src="js/bridge.js"></script>') < 0) return;
         const page = html.replace('<script src="js/bridge.js"></script>', () => '<script>' + bridge.replace(/<\/script/gi, '<\\/script') + '</script>');
         try {
           localStorage.setItem('ep_ota_html', page);
           localStorage.setItem('ep_ota_bundle', bundle);
+          localStorage.setItem('ep_ota_worker', workerSrc);
           localStorage.setItem('ep_ota_meta', JSON.stringify(nv));
         } catch (e) {
-          ['ep_ota_html', 'ep_ota_bundle', 'ep_ota_meta'].forEach((k) => { try { localStorage.removeItem(k); } catch (e2) { /* */ } });
+          ['ep_ota_html', 'ep_ota_bundle', 'ep_ota_worker', 'ep_ota_meta'].forEach((k) => { try { localStorage.removeItem(k); } catch (e2) { /* */ } });
           return;
         }
       }
       updateBanner('Energipilot ' + nv.core + ' er hentet', 'Genstart', () => {
-        try { boot && boot.save(); } catch (e) { /* */ }
-        location.replace('index.html');
+        saveCore();
+        setTimeout(() => location.replace('index.html'), 400);
       });
     } catch (e) { /* offline or GitHub unreachable: try again later */ }
   }
@@ -367,7 +380,7 @@
     new URLSearchParams(api.query).forEach((v, k) => { query[k] = v; });
     let body = (init && init.body) || '';
     if (body && typeof body !== 'string') body = await new Response(body).text();
-    const raw = await boot.handle(method, api.path, JSON.stringify(query), body);
+    const raw = await core('api', { method, path: api.path, query: JSON.stringify(query), body });
     const r = JSON.parse(raw);
     return new Response(r.body, { status: r.status, headers: { 'Content-Type': r.content_type || 'application/json' } });
   };

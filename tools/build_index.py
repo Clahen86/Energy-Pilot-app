@@ -29,7 +29,7 @@ def digest(paths: list[Path]) -> str:
         h.update(p.read_bytes())
     return h.hexdigest()[:16]
 
-web_files = [www / "app.html", www / "js" / "bridge.js", www / "py" / "bundle.json", www / "static" / "suggest.js"]
+web_files = [www / "app.html", www / "js" / "bridge.js", www / "js" / "worker.js", www / "py" / "bundle.json", www / "static" / "suggest.js"]
 native_files = sorted((ROOT / "android-src").glob("*.java")) + [ROOT / "capacitor.config.json"]
 vid, native = digest(web_files), digest(native_files)
 vf = www / "version.json"

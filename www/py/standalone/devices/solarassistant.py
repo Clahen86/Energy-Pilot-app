@@ -1,7 +1,8 @@
 """SolarAssistant: reads and controls the inverter through SolarAssistant's local WebSocket API.
 
 ws://<SolarAssistant>/api/websocket?password=<local password>
-  -> {"topic": "metrics", "event": "join", "payload": {"topics": [{"topic": "*"}]}, "ref": "1"}
+  -> {"topic": "metrics", "event": "join", "payload": {"topics": [{"topic": "*", "max_frequency_s": 5}]}, "ref": "1"}
+     (at most one update per topic every 5 s - SolarAssistant can send far more than a phone should chew through)
   <- definition {topic, device, group, name, unit} once per topic, then data {metrics: [{topic, value}]}
   -> set {topic, value, verify}  <- set_result {topic, result: ok|error, message}
 
@@ -172,7 +173,7 @@ class SolarAssistant(Device):
                 await self.ws.connect(self._url())
                 self.status = "forbundet"
                 delay = 2.0
-                await self._send("join", {"topics": [{"topic": "*"}]})
+                await self._send("join", {"topics": [{"topic": "*", "max_frequency_s": 5}]})
                 while True:
                     raw = await self.ws.recv()
                     if raw is None:
