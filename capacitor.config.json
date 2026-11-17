@@ -1,0 +1,8 @@
+{
+  "appId": "dk.energipilot.app",
+  "appName": "Energipilot",
+  "webDir": "www",
+  "plugins": {
+    "CapacitorHttp": { "enabled": true }
+  }
+}
