@@ -42,7 +42,9 @@
   const DEV = new URLSearchParams(location.search).get('dev') === '1';
   const realFetch = window.fetch.bind(window);
   let resolveReady, rejectReady;
-  const ready = new Promise((res, rej) => { resolveReady = res; rejectReady = rej; });
+  let isReady = false;
+  const ready = new Promise((res, rej) => { resolveReady = () => { isReady = true; res(); }; rejectReady = rej; });
+  ready.catch(() => {});
 
   // ---------- Indlæsningsskærm ----------
   const overlay = document.createElement('div');
@@ -60,13 +62,33 @@
     '.ep-boot-err{color:#ff5d6c;white-space:pre-wrap;text-align:left;font-size:12px;margin-top:12px;max-height:40vh;overflow:auto}' +
     '#ep-demo{position:fixed;left:50%;transform:translateX(-50%);top:calc(env(safe-area-inset-top) + 4px);z-index:50;background:rgba(124,108,255,.18);color:#c8c0ff;' +
     'font:600 11px -apple-system,system-ui,sans-serif;padding:3px 10px;border-radius:999px;pointer-events:none;letter-spacing:.02em}';
+  // Har telefonen et seneste overblik fra sidst, vises panelet med det samme med de tal, og en lille besked
+  // øverst fortæller, at motoren starter. Ellers (første gang) vises indlæsningsskærmen.
+  let quick = null;
+  if (!DEV) {
+    try {
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.indexOf('ep_c|' + MODE + '|/api/overview') === 0) { quick = JSON.parse(localStorage.getItem(k)); break; }
+      }
+    } catch (e) { quick = null; }
+  }
+  const note = document.createElement('div');
+  note.id = 'ep-starting';
+  note.style.cssText = 'position:fixed;left:50%;transform:translateX(-50%);top:calc(env(safe-area-inset-top) + 4px);z-index:55;background:#3a2f12;color:#f5b544;' +
+    'font:600 11px -apple-system,system-ui,sans-serif;padding:4px 12px;border-radius:999px;pointer-events:none;white-space:nowrap';
+  function noteText(pct) {
+    const t = quick && quick.t ? new Date(quick.t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+    note.textContent = 'Starter' + (pct != null ? ' ' + Math.round(pct) + ' %' : '…') + (t ? ' · viser tal fra kl. ' + t : '');
+  }
   function mount() {
     document.head.appendChild(style);
-    document.body.appendChild(overlay);
+    if (quick) { noteText(null); document.body.appendChild(note); } else document.body.appendChild(overlay);
   }
   if (document.body) mount(); else document.addEventListener('DOMContentLoaded', mount);
 
   function step(msg, pct) {
+    if (quick) { noteText(pct); return; }
     const m = document.getElementById('ep-boot-msg');
     const f = document.getElementById('ep-boot-fill');
     if (m) m.textContent = msg;
@@ -74,6 +96,7 @@
   }
 
   function fail(err) {
+    if (quick) { quick = null; note.remove(); document.body.appendChild(overlay); }
     step('Kunne ikke starte', 100);
     const box = overlay.querySelector('.ep-boot-box');
     const pre = document.createElement('div');
@@ -173,7 +196,7 @@
     step('Klar', 100);
     document.addEventListener('visibilitychange', () => { if (document.hidden) saveCore(); });
     resolveReady();
-    setTimeout(() => overlay.remove(), 300);
+    setTimeout(() => { overlay.remove(); note.remove(); }, 300);
     if (MODE === 'demo') {
       const tag = document.createElement('div');
       tag.id = 'ep-demo';
@@ -371,18 +394,66 @@
     return { path: '/' + m[1], query: m[2] || '' };
   }
 
+  // Seneste svar gemmes, så panelet kan vises med det samme ved opstart og ikke står stille, mens motoren regner
+  // (planlægning og læring kan tage mange sekunder på en telefon). Ændringer (POST) venter altid på kernen.
+  const KEEP = /^\/api\/(overview|settings|status|control|selftest)$/;  // gemmes også på telefonen til næste opstart
+  const WAIT_MS = 800;
+  const answers = new Map();
+  const savedAt = {};
+  let strictUntil = 0;
+  const ckey = (path, query) => 'ep_c|' + MODE + '|' + path + query;
+
+  function lastAnswer(key) {
+    if (answers.has(key)) return answers.get(key);
+    let v = null;
+    try { v = JSON.parse(localStorage.getItem(key) || 'null'); } catch (e) { v = null; }
+    answers.set(key, v);
+    return v;
+  }
+
+  function remember(key, path, r) {
+    if (r.status !== 200 || !r.body || r.body.length > 600000) return;
+    const v = { t: Date.now(), body: r.body, ct: r.content_type };
+    answers.set(key, v);
+    if (KEEP.test(path) && Date.now() - (savedAt[key] || 0) > 20000) {
+      savedAt[key] = Date.now();
+      try { localStorage.setItem(key, JSON.stringify(v)); } catch (e) { /* fuldt: så kun i hukommelsen */ }
+    }
+  }
+
+  const respond = (body, status, ct) => new Response(body, { status, headers: { 'Content-Type': ct || 'application/json' } });
+
   window.fetch = async function (input, init) {
     const api = apiPath(input);
     if (!api) return realFetch(input, init);
-    await ready;
     const method = ((init && init.method) || (input && input.method) || 'GET').toUpperCase();
     const query = {};
     new URLSearchParams(api.query).forEach((v, k) => { query[k] = v; });
     let body = (init && init.body) || '';
     if (body && typeof body !== 'string') body = await new Response(body).text();
-    const raw = await core('api', { method, path: api.path, query: JSON.stringify(query), body });
-    const r = JSON.parse(raw);
-    return new Response(r.body, { status: r.status, headers: { 'Content-Type': r.content_type || 'application/json' } });
+    const ask = () => core('api', { method, path: api.path, query: JSON.stringify(query), body }).then((raw) => JSON.parse(raw));
+    if (method !== 'GET') {
+      strictUntil = Date.now() + 15000;  // after a change the panel must see the real answer, not the last one
+      await ready;
+      const r = await ask();
+      strictUntil = Date.now() + 15000;
+      return respond(r.body, r.status, r.content_type);
+    }
+    const key = ckey(api.path, api.query);
+    const last = lastAnswer(key);
+    if (!isReady) {
+      if (last) return respond(last.body, 200, last.ct);
+      await ready;
+    }
+    const fresh = ask().then((r) => { remember(key, api.path, r); return r; });
+    if (last && Date.now() > strictUntil) {
+      fresh.catch(() => {});
+      const r = await Promise.race([fresh, new Promise((res) => setTimeout(() => res(null), WAIT_MS))]).catch(() => null);
+      if (!r) return respond(last.body, 200, last.ct);
+      return respond(r.body, r.status, r.content_type);
+    }
+    const r = await fresh;
+    return respond(r.body, r.status, r.content_type);
   };
 
   if (DEV) {

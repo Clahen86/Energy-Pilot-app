@@ -172,7 +172,7 @@ class VirtualHA:
                 _LOGGER.warning("Device %s could not be read", d.name, exc_info=True)
         # Give the devices a moment to report before Energy Pilot looks for them (a device that never answers is
         # simply shown as unavailable - the engine finds it once it does).
-        for _ in range(60):
+        for _ in range(24):
             if all(d.has_data() for d in self.devices):
                 break
             await asyncio.sleep(0.25)
