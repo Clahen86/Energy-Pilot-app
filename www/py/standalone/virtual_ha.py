@@ -170,6 +170,18 @@ class VirtualHA:
                 await d.refresh(0.0)
             except Exception:  # noqa: BLE001 - a device that can't be reached must not stop the app
                 _LOGGER.warning("Device %s could not be read", d.name, exc_info=True)
+        # Give the devices a moment to report before Energy Pilot looks for them (a device that never answers is
+        # simply shown as unavailable - the engine finds it once it does).
+        for _ in range(60):
+            if all(d.has_data() for d in self.devices):
+                break
+            await asyncio.sleep(0.25)
+            for d in self.devices:
+                if not d.has_data():
+                    try:
+                        await d.refresh(0.0)
+                    except Exception:  # noqa: BLE001
+                        pass
         self.connected.set()
         _LOGGER.info("Virtual Home Assistant ready (%s entities, %s devices)", len(self.states), len(self.devices))
         saved = time.time()

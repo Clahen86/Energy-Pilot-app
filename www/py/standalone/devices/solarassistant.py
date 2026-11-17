@@ -274,6 +274,9 @@ class SolarAssistant(Device):
         self.values[topic] = sa_value
         self.set(entity_id, value)
 
+    def has_data(self) -> bool:
+        return bool(self.last_data)
+
     async def refresh(self, dt: float) -> None:
         if self.online and self.last_data and time.time() - self.last_data > 120:
             self.status = "ingen data i 2 minutter"

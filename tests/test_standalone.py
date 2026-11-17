@@ -37,11 +37,17 @@ class Standalone(unittest.TestCase):
             self.assertEqual(sa["missing"], [])
             self.assertEqual(keba["status"], "forbundet")
 
-            await asyncio.sleep(40)  # main() waits 20 s before the first engine round
+            await asyncio.sleep(30)  # main() waits 20 s before the first engine round
+            ctl: dict = {}
+            for _ in range(60):  # the engine's first round (slower on a busy machine)
+                ctl = json.loads(json.loads(await boot.handle("GET", "/api/control"))["body"])
+                if (ctl.get("battery") or {}).get("profile") and any(
+                        s["domain"] in ("select", "number", "switch") for s in boot._ha.service_log):
+                    break
+                await asyncio.sleep(2)
             ov = json.loads(json.loads(await boot.handle("GET", "/api/overview", '{"lang": "da"}'))["body"])
             self.assertTrue(ov["flow"]["has"]["battery"] and ov["flow"]["has"]["ev"] and ov["flow"]["has"]["pv"])
             self.assertTrue(ov["plan"]["hours"])
-            ctl = json.loads(json.loads(await boot.handle("GET", "/api/control"))["body"])
             self.assertEqual(ctl["battery"]["profile"]["key"], "growatt")
             self.assertEqual(ctl["battery"]["profile"]["check"]["charge"]["missing"], [])
             self.assertIn("growatt_sph", json.dumps(ctl["battery"]["profile"]))

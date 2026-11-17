@@ -60,6 +60,10 @@ class Device:
 
     # ---- what a driver does ----
 
+    def has_data(self) -> bool:
+        """True once the device has reported (the app waits briefly for this before the engine starts)."""
+        return True
+
     async def refresh(self, dt: float) -> None:
         """Read the device (dt: seconds since last time) and publish its entities."""
 

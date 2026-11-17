@@ -114,6 +114,9 @@ class Keba(Device):
         self.set(self.e_enable, "on" if int(r2.get("Enable sys", 0) or 0) else "off", keba_state=state,
                  error_1=r2.get("Error1"), error_2=r2.get("Error2"))
 
+    def has_data(self) -> bool:
+        return bool(self.r2)
+
     def services(self) -> dict[str, list[str]]:
         return {"keba": ["set_current", "enable", "disable", "set_energy", "request_data", "set_failsafe", "start", "stop"]}
 
