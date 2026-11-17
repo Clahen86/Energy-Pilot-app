@@ -35,8 +35,27 @@ class Ledger:
             self.state.update(json.loads(self.file.read_text()))
         except (OSError, ValueError):
             pass
+        self._seed_all()
         self._at: datetime | None = None
         self._saved_at = 0.0
+
+    def _seed_all(self) -> None:
+        """Sun and battery came later (0.89): the days before it start with what the battery saved - the sun's own
+        part wasn't measured then, so it's a little low for them, but it never shows less than the battery alone."""
+        s = self.state
+        if s.get("all_seeded") or not s.get("since"):
+            return
+        # 0.89.0 counted sun and battery only from the moment it started: that day also gets the battery's saving
+        # from before (the battery's part after it is then counted twice - a little, and only for that one day)
+        first = s["days"].get(s.get("all_since") or "")
+        if first and "all" in first:
+            first["all"] += first.get("saved", 0.0)
+        for day in s["days"].values():
+            if "all" not in day:
+                day["all"] = day.get("saved", 0.0)
+        s["older_all"] = s.get("older", 0.0)
+        s["all_since"] = s["since"]
+        s["all_seeded"] = True
 
     def save(self) -> None:
         try:
@@ -107,6 +126,9 @@ class Ledger:
         day["cost"] += c
         day["without"] += w
         day["saved"] += w - c
+        # Sun and battery together: against buying all the house used (grid without battery and sun) - closer to the bill
+        day["all"] = day.get("all", 0.0) + cost(without + pv) - c
+        s["all_since"] = s.get("all_since") or now.date().isoformat()
         day["bought" if grid > 0 else "sold"] += abs(grid) / 1000 * hours
         if now.timestamp() - self._saved_at > 300:
             self._trim(now)
@@ -118,14 +140,16 @@ class Ledger:
         cut = now.date().replace(year=now.year - 2).isoformat()
         old = [d for d in self.state["days"] if d < cut]
         if old:
-            self.state["older"] = round(self.state.get("older", 0.0) + sum(self.state["days"].pop(d)["saved"] for d in old), 2)
+            gone = [self.state["days"].pop(d) for d in old]
+            self.state["older"] = round(self.state.get("older", 0.0) + sum(g["saved"] for g in gone), 2)
+            self.state["older_all"] = round(self.state.get("older_all", 0.0) + sum(g.get("all", 0.0) for g in gone), 2)
 
     def summary(self, now: datetime, other_avg: float | None = None) -> dict[str, Any]:
         s, days = self.state, self.state["days"]
         d, m, y = now.date().isoformat(), now.strftime("%Y-%m"), str(now.year)
 
-        def total(prefix: str) -> float:
-            return round(sum(v["saved"] for k, v in days.items() if k.startswith(prefix)), 2)
+        def total(prefix: str, key: str = "saved") -> float:
+            return round(sum(v.get(key, 0.0) for k, v in days.items() if k.startswith(prefix)), 2)
 
         avg = s["stored_cost"] / s["stored_kwh"] if s["stored_kwh"] > 0.05 else None
         return {
@@ -135,5 +159,9 @@ class Ledger:
             # sun vs grid only once most of what's in it was charged while this was kept
             "sun_share": round(min(1.0, s.get("stored_sun", 0.0) / s["stored_kwh"]), 2)
             if s["stored_kwh"] > 0.2 and s.get("sun_seen", 0.0) >= s["stored_kwh"] * 0.6 else None,
+            # sun and battery together (kept from when this came in)
+            "all": {"today": total(d, "all"), "month": total(m, "all"), "year": total(y, "all"),
+                    "total": round(total("", "all") + s.get("older_all", 0.0), 2), "since": s.get("all_since")}
+            if s.get("all_since") else None,
             "since": s.get("since"), "today_detail": {k: round(v, 2) for k, v in (days.get(d) or {}).items()},
         }
