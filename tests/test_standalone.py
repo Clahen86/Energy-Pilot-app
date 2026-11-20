@@ -20,7 +20,18 @@ class Standalone(unittest.TestCase):
         (data / "energy_pilot_settings.json").write_text(json.dumps(
             {"language": "da", "setup_done": True, "control": {"battery": "control", "car": "control"}}))
         import standalone.boot as boot
+        from standalone.devices import simulators
 
+        # The inverter starts as its owner left it (Battery first), so Energy Pilot has something to change - a core
+        # that only writes values that aren't already set sends nothing when its plan matches the simulator's defaults.
+        sph_init = simulators.SphPhysics.__init__
+
+        def left_by_owner(sph, *args, **kwargs):
+            sph_init(sph, *args, **kwargs)
+            sph.s["work_mode_priority"] = "Battery first"
+
+        simulators.SphPhysics.__init__ = left_by_owner
+        self.addCleanup(setattr, simulators.SphPhysics, "__init__", sph_init)
         boot.DATA = data
 
         async def go():
