@@ -49,17 +49,20 @@ PROFILES: dict[str, dict[str, Any]] = {
                    (r"switch\..*grid_first_slot_1_enabled$", "off", None)],  # selling's all-day time slot off again
         "optional": [r"number\..*free_mode_discharge_rate$", r"number\..*free_mode_charge_rate$", r"number\..*load_first_stop_charge$",
                      r"switch\..*grid_first_slot_1_enabled$"],
-        "charge": [(r"switch\..*battery_first_slot_1_enabled$", "on", None), (r"select\..*battery_first_slot_1_start$", "select", "{lease_from}"),
-                   (r"select\..*battery_first_slot_1_end$", "select", "{lease_to}"), (r"number\..*battery_first_charge_rate$", "number", "{rate}"),
+        # The mode first and the time slot last: SolarAssistant writes "Battery first" as an all-day slot (00:00-23:59),
+        # which then put over the slot just written (21 November).
+        "charge": [(r"select\..*work_mode_priority$", "select", "Battery first"),
+                   (r"number\..*battery_first_charge_rate$", "number", "{rate}"),
                    (r"number\..*battery_first_stop_charge$", "number", "{target}"), (r"select\..*battery_first_grid_charge$", "select", "Enabled"),
-                   (r"select\..*work_mode_priority$", "select", "Battery first")],
+                   (r"switch\..*battery_first_slot_1_enabled$", "on", None), (r"select\..*battery_first_slot_1_start$", "select", "{lease_from}"),
+                   (r"select\..*battery_first_slot_1_end$", "select", "{lease_to}")],
         # Selling from the battery (only when the user turns it on).
-        "export": [(r"switch\..*grid_first_slot_1_enabled$", "on", None),
-                   (r"select\..*grid_first_slot_1_start$", "select", "{lease_from}"),
-                   (r"select\..*grid_first_slot_1_end$", "select", "{lease_to}"),
+        "export": [(r"select\..*work_mode_priority$", "select", "Grid first"),
                    (r"number\..*grid_first_discharge_rate$", "number", "{rate}"),
                    (r"number\..*grid_first_stop_discharge$", "number", "{target}"),
-                   (r"select\..*work_mode_priority$", "select", "Grid first")],
+                   (r"switch\..*grid_first_slot_1_enabled$", "on", None),
+                   (r"select\..*grid_first_slot_1_start$", "select", "{lease_from}"),
+                   (r"select\..*grid_first_slot_1_end$", "select", "{lease_to}")],
     },
     "growatt_tlxh": {
         "name": "Growatt (MIN/MOD TL-XH)",
@@ -519,24 +522,53 @@ CHARGER_SERVICES = {
 }
 
 
-def alpha_windows(now: Any) -> dict[str, str]:
-    """Alpha ESS: charging from this quarter for 4 h; the parked charge and discharge windows 12 h away, apart."""
+LEAD_MIN = 30  # a new window starts this long before the quarter now: the inverter is well inside it at once
+LEASE_LEAD_MIN = 90  # the inverter's own slot (Growatt, GivEnergy) starts this much earlier still: inside it also with
+# a clock up to 2 hours slow. A start in the past changes nothing with a right clock - the slot is only turned on when
+# the plan's block begins, and off again when it ends. (Alpha ESS runs on the cloud's clock: not needed there.)
+CAP_H = 3  # a window never runs further ahead than this (in whole hours, so it isn't moved every quarter)
+PAD_H = 2  # the inverter's slot ends this long after the plan's block: a clock that runs fast (21 November: a Growatt
+# 70 minutes ahead, never moved to winter time) ended the slot early. Energy Pilot ends the block itself on time.
+
+
+def quarter(now: Any) -> Any:
+    return now.replace(minute=now.minute - now.minute % 15, second=0, microsecond=0)
+
+
+def window_start(now: Any) -> Any:
+    """Where a new charge (or sell) window starts: a little before now, never before midnight."""
     from datetime import timedelta
 
-    q = now.replace(minute=now.minute - now.minute % 15, second=0, microsecond=0)
+    q = quarter(now)
+    return max(q - timedelta(minutes=LEAD_MIN), q.replace(hour=0, minute=0))
+
+
+def alpha_windows(now: Any, start: Any = None, end: Any = None) -> dict[str, str]:
+    """The inverter's own time windows. Charging (or selling) runs from where the plan's block began to where it ends:
+    written once and left alone while the block lasts - not moved on every quarter (a Growatt went back to Load first
+    for minutes each time its slot was moved to start at the quarter now). Without a block: from a little before now,
+    75 minutes ahead (Alpha ESS: 4 h). The parked Alpha windows are 12 h away, apart."""
+    from datetime import timedelta
+
+    q = quarter(now)
     hm = lambda d: d.strftime("%H:%M")  # noqa: E731
-    end = q + timedelta(hours=4)
-    if end.date() == q.date():
-        win = {"now_from": hm(q), "now_to": hm(end), "now2_from": "00:00", "now2_to": "00:00"}
+    s = start if start is not None and start <= now and start.date() == q.date() else window_start(now)
+    cap = q.replace(minute=0) + timedelta(hours=CAP_H + 1)  # 3-4 h ahead, moved once an hour at most
+    if end is not None:
+        alpha_end = max(min(end, cap), q + timedelta(minutes=30))
+        e = max(min(end + timedelta(hours=PAD_H), cap + timedelta(hours=PAD_H)), q + timedelta(minutes=30))
+    else:
+        e, alpha_end = q + timedelta(minutes=75), q + timedelta(hours=4)
+    if alpha_end.date() == q.date():
+        win = {"now_from": hm(s), "now_to": hm(alpha_end), "now2_from": "00:00", "now2_to": "00:00"}
     elif q.hour == 23 and q.minute == 45:  # the last quarter: from midnight (period 2 stays empty)
-        win = {"now_from": "00:00", "now_to": hm(end), "now2_from": "00:00", "now2_to": "00:00"}
+        win = {"now_from": "00:00", "now_to": hm(alpha_end), "now2_from": "00:00", "now2_to": "00:00"}
     else:  # over midnight: until 23:45, and from 00:00 on (AlphaESS takes periods within one day only)
-        win = {"now_from": hm(q), "now_to": "23:45", "now2_from": "00:00", "now2_to": hm(end)}
-    # A lease: the inverter's own time slot runs from this quarter to 60-75 minutes ahead (never past midnight) and is
-    # moved on every quarter. Should Energy Pilot, Home Assistant or the network stop, the slot runs out and the inverter
-    # goes back to its normal running by itself - an order is never left standing all day (Growatt, GivEnergy).
-    lease_end = q + timedelta(minutes=75)
-    lease = {"lease_from": hm(q), "lease_to": hm(lease_end) if lease_end.date() == q.date() else "23:59"}
+        win = {"now_from": hm(s), "now_to": "23:45", "now2_from": "00:00", "now2_to": hm(alpha_end)}
+    # A lease: should Energy Pilot, Home Assistant or the network stop, the slot runs out and the inverter goes back to
+    # its normal running by itself - an order is never left standing all day (Growatt, GivEnergy).
+    ls = max(s - timedelta(minutes=LEASE_LEAD_MIN), q.replace(hour=0, minute=0))
+    lease = {"lease_from": hm(ls), "lease_to": hm(e) if e.date() == q.date() else "23:59"}
     return {**win, **lease,
             "park_c_from": hm(q + timedelta(hours=12)), "park_c_to": hm(q + timedelta(hours=12, minutes=15)),
             "park_d_from": hm(q + timedelta(hours=12, minutes=30)), "park_d_to": hm(q + timedelta(hours=12, minutes=45))}

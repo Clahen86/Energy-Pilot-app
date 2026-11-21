@@ -31,6 +31,26 @@ GENERIC_PLATFORMS = ("mqtt", "template", "group", "min_max", "integration", "uti
 
 _LOGGER = logging.getLogger(__name__)
 REASSERT_S = 1800
+RATE_BAND = 5  # % of the charge power: a smaller change while charging isn't written (fewer writes to the inverter)
+TARGET_BAND = 3  # % on the stop level, likewise - as long as the battery isn't close to the old one
+
+
+def steady(prev: dict | None, want: dict) -> dict:
+    """While the battery charges from the grid, small changes in the power and the stop level are left out: the old
+    values are kept, so nothing new is written. A change of intent, or a bigger step, goes through as always."""
+    if not prev or prev.get("intent") != "charge" or want.get("intent") != "charge":
+        return want
+    old, new = prev.get("ctx") or {}, dict(want.get("ctx") or {})
+    try:
+        if abs(float(new["rate"]) - float(old["rate"])) < RATE_BAND:
+            for k in ("rate", "power_w", "power_kw", "charge_a"):
+                if k in old:
+                    new[k] = old[k]
+        if abs(float(new["target"]) - float(old["target"])) <= TARGET_BAND and float(old["target"]) >= float(new.get("soc") or 0) + 2:
+            new["target"] = old["target"]
+    except (KeyError, TypeError, ValueError):
+        return want
+    return {**want, "ctx": new}
 
 
 class Controller:
@@ -324,6 +344,28 @@ class Controller:
 
     # ---------- deciding and acting ----------
 
+    def _windows(self, b: dict[str, Any], step: dict[str, Any]) -> dict[str, str]:
+        """The inverter's time windows for the plan's block now: from where the block began (remembered, or a little
+        before now) to where the same action ends in the plan. The same while the block lasts - nothing to rewrite."""
+        now = datetime.now(ZoneInfo(self.ha.config.get("time_zone") or "UTC"))
+        act = step.get("action")
+        end = None
+        try:
+            run = 0
+            for s in b.get("steps") or []:
+                if s.get("action") != act:
+                    break
+                run += 1
+            if run:
+                last = datetime.fromisoformat(b["steps"][run - 1]["t"]).astimezone(now.tzinfo)
+                end = last + timedelta(minutes=b.get("slot_min") or 60)
+        except (KeyError, TypeError, ValueError):
+            end = None
+        blk = getattr(self, "_block", None)
+        if not (blk and blk[0] == act and blk[1] <= now and blk[1].date() == now.date()):
+            blk = self._block = (act, adapters.window_start(now))
+        return adapters.alpha_windows(now, blk[1], end if act in ("charge_grid", "export") else None)
+
     def intents(self) -> dict[str, dict[str, Any]]:
         res = (self.engine.result or {}) if self.engine else {}
         out: dict[str, dict[str, Any]] = {}
@@ -368,7 +410,7 @@ class Controller:
                 "max_power_w": round(bat.max_discharge_kw * 1000), "max_charge_w": round(bat.max_charge_kw * 1000),
                 "power_kw": round(charge_kw, 2), "max_charge_kw": round(bat.max_charge_kw, 2), "max_power_kw": round(bat.max_discharge_kw, 2), "export_w": export_w,
                 "device_id": getattr(self, "battery_device", None) or "", "serial": getattr(self, "battery_serial", "") or "",
-                **adapters.alpha_windows(datetime.now(ZoneInfo(self.ha.config.get("time_zone") or "UTC")))}}
+                **self._windows(b, step)}}
             if any("{charge_a}" in str(self.profile_steps(p) or {}) for p in ["battery", *self.bat_parts()]):
                 # Deye limits charging from the grid by a current: the planned power over the battery's voltage.
                 out["battery"]["ctx"]["charge_a"] = max(1, round(charge_kw * 1000 / self._battery_volt()))
@@ -600,10 +642,16 @@ class Controller:
             mode = self.mode(part)
             if mode == "off":
                 continue
-            calls = self.calls(part, want)
             prev = self.last.get(part)
-            changed = prev is None or prev["intent"] != want["intent"] or prev["ctx"] != want["ctx"]
+            if self.is_battery(part):
+                want = steady(prev, want)
+            calls = self.calls(part, want)
             prof = self._prof(part)
+            # Changed when something else would be written: the level or a clock in the context that no call uses
+            # (the battery's level while it charges) is no reason to write the same values again. An inverter that
+            # forgets (Victron) gets everything again on any change, as before.
+            changed = prev is None or prev["intent"] != want["intent"] or (prev["ctx"] != want["ctx"] and (
+                (self._forced(prof) and self.is_battery(part)) or self.calls(part, prev) != calls))
             again = prof.get("reassert_s", REASSERT_S) if self.is_battery(part) else REASSERT_S
             due = prev is None or time.time() - prev["t"] > again  # Solis' remote control times out after 30 min
             # A value that held and then changed by itself is set again at once (at most once a minute) - the
@@ -951,6 +999,34 @@ class Controller:
         else:
             self.car_stuck["car"] = True  # shown as a note: the car may be full or wait for its own timer
 
+    async def recheck(self) -> None:
+        """Every minute: a battery value that held and then changed by itself (the inverter left its slot) is found
+        within a minute, not at the next round - the round then sets it again (see tick)."""
+        prev = self.last.get("battery")
+        if (not prev or prev.get("result") != "ok" or self.mode("battery") != "control" or self.blocked("battery")
+                or "battery" in getattr(self, "testing", set()) or time.time() - prev["t"] < 60 or self._lock().locked()):
+            return
+        if any(self._matches(c) is False for c in prev.get("calls") or []):
+            await self.tick(("battery",))
+
+    def _dst_note(self) -> dict[str, Any] | None:
+        """A week after the clocks change, where they do: an inverter steered by time slots keeps its own clock, and
+        many don't move it by themselves - the slots are then an hour off. Only shown where summer time exists."""
+        prof = adapters.PROFILES.get(self.profile_key("battery") or "") or {}
+        if not any("{lease_" in str(v) or "{now_from}" in str(v) for i in ("charge", "export") for v in prof.get(i, [])):
+            return None
+        try:
+            tz = ZoneInfo(self.ha.config.get("time_zone") or "UTC")
+        except Exception:  # noqa: BLE001
+            return None
+        now = datetime.now(tz)
+        for days in range(0, 8):
+            d = now - timedelta(days=days)
+            before = (d - timedelta(days=1)).utcoffset()
+            if before is not None and d.utcoffset() != before:
+                return {"key": "clock_dst", "level": "info", "vals": {"date": d.date().isoformat()}, "goto": "battery"}
+        return None
+
     def watch_checks(self) -> list[dict[str, Any]]:
         """Warnings for the self-check: another system steers the battery too (Predbat, an automation, the inverter's
         own schedule) - they work against each other."""
@@ -968,6 +1044,8 @@ class Controller:
         pm = str((self.ha.states.get("select.predbat_mode") or {}).get("state") or "")
         if self.mode("battery") == "control" and pm and pm.lower() not in ("monitor", "unavailable", "unknown"):
             out.append({"key": "predbat_on", "level": "warn", "vals": {"mode": pm}, "goto": "battery"})
+        if self.mode("battery") == "control" and (note := self._dst_note()):
+            out.append(note)
         return out
 
     def _took(self, calls: list[dict[str, Any]]) -> bool:

@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+import asyncio
+import copy
 import logging
 import math
 import re
@@ -422,6 +424,8 @@ class Engine:
         from . import common as _common
 
         self.learning.shared_sun = lambda: _common.sun_bias(self.ov)
+        self.learning.where = lambda: self.home()  # for the panels' direction (sunshape.py)
+        self.learning.tune_on = lambda: self.ov.settings.get("self_tune", True) is not False  # tune.py, on unless switched off
         from .skynet import Sky
 
         self.sky = Sky()
@@ -1075,9 +1079,29 @@ class Engine:
             es, em = self.price_model.score(now)
             if es is not None or em is not None:
                 self.mixer.update("price", es, em, self.price_days)
+            await self._tune(report["day"])
             self.learning.save()
         if report:
             _LOGGER.info("Learned from %s: %s", report["day"], report)
+
+    async def _tune(self, day: str) -> None:
+        """Its own settings tested on the last two weeks (tune.py) - in a thread, it takes a while; never stops the night."""
+        if not self.learning.tuned() or self.ov.settings.get("offgrid") or not self.ov.role("battery_soc"):
+            return
+        from . import tune
+
+        st = self.ov.settings
+        sell = float(st.get("sell_price") or 0) if st.get("sell") else 0.0
+        L = self.learning
+        try:
+            work = {"recent": L.state.get("recent") or {}, "tune": copy.deepcopy(L.state.get("tune") or {"f": 1.0, "m": 0.0, "log": []})}
+            t = await asyncio.get_running_loop().run_in_executor(
+                None, tune.nightly, work, self.settings(), sell, L.end_factor, L.margin, day)
+            L.state["tune"] = t  # handed back in the loop: the panel never reads it half-written
+            if (t.get("log") or [{}])[-1].get("d") == day:
+                _LOGGER.info("Own settings moved after testing %s days: %s", t.get("days"), t["log"][-1])
+        except Exception:  # noqa: BLE001 - an extra on top of what was learned: the plan goes on without it
+            _LOGGER.warning("The nightly test of the settings was skipped", exc_info=True)
 
     def _generator(self, now: datetime, f: dict[str, Any], hours: list[tuple[datetime, float, float]]) -> dict[str, Any]:
         """Off-grid: should the generator run now? (see generator.py)"""
@@ -1148,7 +1172,9 @@ class Engine:
         L = self.learning
         clouds = [((self.weather.at(t) or {}).get("cloud") if self.weather else None) for t in times]
         dear = sorted(r["price"] for r in rows)[int(len(rows) * 0.75)] if len(rows) > 3 else None
-        sun_simple = [L.sun(r.get("sun", 0.0), clouds[i]) for i, r in enumerate(rows)]
+        # The panels' own shape over the day (sunshape.py) - not on top of the own forecast, which learns it per hour itself.
+        bend = getattr(self.ov, "sun_source", None) != "own"
+        sun_simple = [L.sun(r.get("sun", 0.0), clouds[i], times[i].hour if bend else None) for i, r in enumerate(rows)]
         sun_ml = self.solar_model.predict(times, w) if w else {}
         sw = self.mixer.share("sun")
         sun = [Mixer.mix(s, sun_ml.get(t), sw) for s, t in zip(sun_simple, times)]
@@ -1156,10 +1182,12 @@ class Engine:
         # hours are pulled towards what the houses upwind see now.
         self.sun_now = (times[0], sun[0]) if times else None
         sun = _sky.adjust(self.sky.fresh(), self.home(), times, sun, now, self.weather)
-        hours = [Hour(t, r["price"], self.sell_at(sells, t, sell), house[i] + (L.margin if dear is not None and r["price"] >= dear else 0.0), sun[i])
+        end_f, margin = L.plan_settings()
+        hours = [Hour(t, r["price"], self.sell_at(sells, t, sell), house[i] + (margin if dear is not None and r["price"] >= dear else 0.0), sun[i])
                  for i, (t, r) in enumerate(zip(times, rows))]
         L.expect([{"t": times[0].isoformat(), "house": house[0], "sun": hours[0].sun, "price": rows[0]["price"], "cloud": clouds[0],
-                   "house_s": simple[0], "house_m": ml[0], "sun_s": sun_simple[0], "sun_m": sun_ml.get(times[0])}])
+                   "house_s": simple[0], "house_m": ml[0], "sun_s": sun_simple[0], "sun_m": sun_ml.get(times[0]),
+                   "sun_raw": rows[0].get("sun")}])
         # Prices per quarter (or half) hour where the market has them: plan in those slots, so the battery and
         # the car use the cheapest quarters inside an hour too. House and sun are spread evenly over the hour.
         hours = split_slots(hours, getattr(self.ov, "fine_prices", None) or {}, now, sells)
@@ -1187,7 +1215,7 @@ class Engine:
                 from dataclasses import replace
 
                 b = replace(b, no_export=cheap_slots(hours))  # no selling while power is cheap - only charging
-            end_value = end_price(hours, b) * L.end_factor
+            end_value = end_price(hours, b) * end_f
             p = plan_battery(hours, f["soc"], b, end_value=end_value)
             # A daily cap on paid feed-in (15 kWh a day, say): what is sold past it earns nothing - the best-paid
             # slots keep the pay, the plan is made again without pay in the rest.
