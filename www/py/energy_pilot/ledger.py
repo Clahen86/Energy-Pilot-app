@@ -64,7 +64,8 @@ class Ledger:
             pass
 
     def tick(self, now: datetime, flow: dict[str, Any], price: float | None, sell: float, capacity_kwh: float,
-             min_soc: float, efficiency: float, solar_value: str = "free") -> None:
+             min_soc: float, efficiency: float, solar_value: str = "free", max_charge_kw: float = 3.0,
+             max_discharge_kw: float = 3.0) -> None:
         prev, self._at = self._at, now
         if prev is None or price is None:
             return
@@ -122,6 +123,8 @@ class Ledger:
             return kwh * price if kwh > 0 else kwh * sell
 
         day = s["days"].setdefault(now.date().isoformat(), {"saved": 0.0, "cost": 0.0, "without": 0.0, "bought": 0.0, "sold": 0.0})
+        # What the power in the battery cost when the day began - so power bought for later isn't a loss today
+        day.setdefault("stored_start", round(s["stored_cost"], 4))
         c, w = cost(grid), cost(without)
         day["cost"] += c
         day["without"] += w
@@ -130,10 +133,32 @@ class Ledger:
         day["all"] = day.get("all", 0.0) + cost(without + pv) - c
         s["all_since"] = s.get("all_since") or now.date().isoformat()
         day["bought" if grid > 0 else "sold"] += abs(grid) / 1000 * hours
+        # Honest: what Energy Pilot itself adds. The same battery in the inverter's own way (the house first: charged by
+        # the sun's surplus, emptied into the house, never from the grid) - run beside the real one, same house and sun.
+        if capacity_kwh and soc is not None:
+            day["selfuse"] = day.get("selfuse", 0.0) + cost(self._selfuse(soc, house + ev - pv, hours, capacity_kwh, min_soc,
+                                                                          efficiency, max_charge_kw, max_discharge_kw))
+            day["cost_p"] = day.get("cost_p", 0.0) + c  # the real cost over the same steps
+            day["pilot"] = day["selfuse"] - day["cost_p"]
         if now.timestamp() - self._saved_at > 300:
             self._trim(now)
             self.save()
             self._saved_at = now.timestamp()
+
+    def _selfuse(self, soc: float, need_w: float, hours: float, capacity_kwh: float, min_soc: float, efficiency: float,
+                 max_charge_kw: float, max_discharge_kw: float) -> float:
+        """One step of the battery left to itself: the grid's watts then. Starts at the real level each day."""
+        s, floor = self.state, capacity_kwh * min_soc / 100
+        if s.get("selfuse_day") != self._at.date().isoformat() or s.get("selfuse_kwh") is None:
+            s["selfuse_day"], s["selfuse_kwh"] = self._at.date().isoformat(), soc / 100 * capacity_kwh
+        kwh, half = s["selfuse_kwh"], math.sqrt(max(0.5, efficiency))
+        if need_w < 0:  # the sun's surplus: into the battery as far as it takes
+            take = min(-need_w / 1000 * hours, max_charge_kw * hours, max(0.0, (capacity_kwh - kwh) / half))
+            s["selfuse_kwh"] = kwh + take * half
+            return need_w + take * 1000 / hours
+        give = min(need_w / 1000 * hours, max_discharge_kw * hours, max(0.0, (kwh - floor) * half))
+        s["selfuse_kwh"] = kwh - give / half
+        return need_w - give * 1000 / hours
 
     def _trim(self, now: datetime) -> None:
         """Days older than two years are summed into one."""
@@ -155,7 +180,10 @@ class Ledger:
         return {
             "stored_kwh": round(s["stored_kwh"], 2), "avg_cost": round(other_avg if other_avg is not None else avg, 3) if (other_avg or avg) is not None else None,
             "avg_source": "other" if other_avg is not None else "own",
-            "today": total(d), "month": total(m), "year": total(y), "total": round(total("") + s.get("older", 0.0), 2),
+            "today": total(d), "month": total(m),
+            # Today with the power still in the battery counted at what it cost: charging for the evening isn't a loss
+            # in the morning, and power bought yesterday that is used today counts at its price.
+            "today_stored": round(total(d) + s["stored_cost"] - days[d]["stored_start"], 2) if "stored_start" in (days.get(d) or {}) else None, "year": total(y), "total": round(total("") + s.get("older", 0.0), 2),
             # sun vs grid only once most of what's in it was charged while this was kept
             "sun_share": round(min(1.0, s.get("stored_sun", 0.0) / s["stored_kwh"]), 2)
             if s["stored_kwh"] > 0.2 and s.get("sun_seen", 0.0) >= s["stored_kwh"] * 0.6 else None,
@@ -163,5 +191,8 @@ class Ledger:
             "all": {"today": total(d, "all"), "month": total(m, "all"), "year": total(y, "all"),
                     "total": round(total("", "all") + s.get("older_all", 0.0), 2), "since": s.get("all_since")}
             if s.get("all_since") else None,
+            # what Energy Pilot added against the battery left to itself (the inverter's own house-first way)
+            "pilot": {"today": total(d, "pilot"), "month": total(m, "pilot"), "year": total(y, "pilot"), "total": total("", "pilot")}
+            if any("pilot" in v for v in days.values()) else None,
             "since": s.get("since"), "today_detail": {k: round(v, 2) for k, v in (days.get(d) or {}).items()},
         }

@@ -202,13 +202,18 @@ async def main() -> None:
             try:
                 tz = _Z(ha.config.get("time_zone") or "UTC")
                 now = _dt.now(tz)
+                if getattr(overview, "selftest", None):
+                    try:
+                        overview.selftest.night_check(now)  # only if the user said yes to testing by itself
+                    except Exception:  # noqa: BLE001
+                        logging.getLogger("energy_pilot.selftest").debug("Night check failed", exc_info=True)
                 prices, _ = collect(ha.states, overview.role("price"), engine.own_prices or [], tz, engine.service_prices or [], overview.price_scale())
                 past = [k for k in prices if k <= now]
                 price = prices[max(past)] if past else None
                 st, b = overview.settings, engine.settings()
                 sell = float(st.get("sell_price") or 0) if st.get("sell") else 0.0
                 sell = engine.sell_at(engine.sell_prices(), now, sell)  # a changing feed-in price, when chosen
-                if (be := overview.role("battery_power")) and (bs := ha.states.get(be)):
+                if (be := overview.role("battery_power")) and (bs := ha.states.get(be)) and not overview.battery_pair():
                     try:
                         raw = float(bs.get("state")) * (1000 if str((bs.get("attributes") or {}).get("unit_of_measurement", "")).lower() == "kw" else 1)
                     except (TypeError, ValueError):
@@ -216,7 +221,7 @@ async def main() -> None:
                     engine.watch_sign(raw, overview.flow().get("soc"))
                 f = overview.flow()
                 engine.ledger.tick(now, f, price, sell, b.capacity_kwh, b.min_soc, b.efficiency,
-                                   st.get("solar_value") or "free")
+                                   st.get("solar_value") or "free", b.max_charge_kw, b.max_discharge_kw)
                 engine.battstats.tick(now, f, b.min_soc)
                 engine.price_model.remember(prices, now)
                 ev = overview.ev() or {}
@@ -224,7 +229,8 @@ async def main() -> None:
                 # each charger's real charge, measured beside the one Energy Pilot would make (for chargers in shadow)
                 extra = f.get("cars") or []
                 own_w = None if f.get("ev") is None else f["ev"] - sum((c.get("power") or 0.0) for c in extra)
-                engine.ghosts.see("car", now, f.get("plug"), own_w, price, 30)
+                engine.ghosts.see("car", now, f.get("plug"), own_w, price, 30,
+                                  engine.ghosts.sun_to_car(own_w, f.get("pv"), f.get("grid"), f.get("battery")), sell)
                 for i, c in enumerate(extra):
                     engine.ghosts.see(f"car{i + 2}", now, c.get("plug"), c.get("power"), price, 30)
                 engine.car_size.see(f.get("plug"), ev.get("soc"), ev.get("session_kwh"))
@@ -239,6 +245,9 @@ async def main() -> None:
                 if st.get("things"):
                     # in shadow nothing is switched: the things act only when Energy Pilot controls something
                     await engine.things.tick(ha, st, now, price, sell, f.get("grid"), act=any(controller.mode(p) == "control" for p in controller.parts()))
+                    if engine.things.replan:  # a machine was just paused: its start time now
+                        engine.things.replan = False
+                        engine.run()
                 if getattr(overview, "selftest", None):
                     await overview.selftest.retry_pending()  # settings a test left while their device was offline
                 bp = controller.last.get("battery") if hasattr(controller, "last") else None
@@ -268,7 +277,22 @@ async def main() -> None:
     await web_runner.setup()
     await web.TCPSite(web_runner, "0.0.0.0", int(os.environ.get("PORT", 8099))).start()
     await runner.start()
-    await asyncio.Event().wait()
+    # Stopped by the Supervisor (SIGTERM): let go of the battery first, so nothing is left standing while away.
+    import signal
+
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except (NotImplementedError, RuntimeError):
+            pass
+    await stop.wait()
+    if overview.controller:
+        try:
+            await overview.controller.let_go()
+        except Exception:  # noqa: BLE001
+            logging.getLogger("energy_pilot").warning("Stopping: could not let go of the battery", exc_info=True)
 
 
 if __name__ == "__main__":

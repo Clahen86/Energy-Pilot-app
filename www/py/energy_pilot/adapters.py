@@ -49,14 +49,14 @@ PROFILES: dict[str, dict[str, Any]] = {
                    (r"switch\..*grid_first_slot_1_enabled$", "off", None)],  # selling's all-day time slot off again
         "optional": [r"number\..*free_mode_discharge_rate$", r"number\..*free_mode_charge_rate$", r"number\..*load_first_stop_charge$",
                      r"switch\..*grid_first_slot_1_enabled$"],
-        "charge": [(r"switch\..*battery_first_slot_1_enabled$", "on", None), (r"select\..*battery_first_slot_1_start$", "select", "00:00"),
-                   (r"select\..*battery_first_slot_1_end$", "select", "23:59"), (r"number\..*battery_first_charge_rate$", "number", "{rate}"),
+        "charge": [(r"switch\..*battery_first_slot_1_enabled$", "on", None), (r"select\..*battery_first_slot_1_start$", "select", "{lease_from}"),
+                   (r"select\..*battery_first_slot_1_end$", "select", "{lease_to}"), (r"number\..*battery_first_charge_rate$", "number", "{rate}"),
                    (r"number\..*battery_first_stop_charge$", "number", "{target}"), (r"select\..*battery_first_grid_charge$", "select", "Enabled"),
                    (r"select\..*work_mode_priority$", "select", "Battery first")],
         # Selling from the battery (only when the user turns it on).
         "export": [(r"switch\..*grid_first_slot_1_enabled$", "on", None),
-                   (r"select\..*grid_first_slot_1_start$", "select", "00:00"),
-                   (r"select\..*grid_first_slot_1_end$", "select", "23:59"),
+                   (r"select\..*grid_first_slot_1_start$", "select", "{lease_from}"),
+                   (r"select\..*grid_first_slot_1_end$", "select", "{lease_to}"),
                    (r"number\..*grid_first_discharge_rate$", "number", "{rate}"),
                    (r"number\..*grid_first_stop_discharge$", "number", "{target}"),
                    (r"select\..*work_mode_priority$", "select", "Grid first")],
@@ -353,12 +353,14 @@ PROFILES: dict[str, dict[str, Any]] = {
         "match": r"foxess|fox_",
         # Hold: Self Use with the on-grid minimum at the battery's level now - "Back-up" may charge from the grid
         # (what the users' own profiles did instead). Normal puts the minimum back.
-        "normal": [(r"number\..*min_soc_on_grid$", "number", "{min_soc}"), (r"select\..*work_mode$", "select", "Self Use")],
-        "hold": [(r"number\..*min_soc_on_grid$", "number", "{soc}"), (r"select\..*work_mode$", "select", "Self Use")],
-        "charge": [(r"number\..*force_charge_power$", "number", "{power_w}"), (r"number\..*force_charge_max_soc$", "number", "{target}"),
+        # "Self Use" in foxess_modbus, "Self-Use" in other Fox integrations: either is picked.
+        "normal": [(r"number\..*min_soc_on_grid$", "number", "{min_soc}"), (r"select\..*work_mode$", "select", "re:^self.?use$")],
+        "hold": [(r"number\..*min_soc_on_grid$", "number", "{soc}"), (r"select\..*work_mode$", "select", "re:^self.?use$")],
+        # Force charge/discharge power is in kW in foxess_modbus (0-5 kW on an H1-5.0) - watts were refused.
+        "charge": [(r"number\..*force_charge_power$", "number", "{power_kw}"), (r"number\..*force_charge_max_soc$", "number", "{target}"),
                    (r"select\..*work_mode$", "select", "Force Charge")],
         # Selling from the battery (only when the user turns it on): checked in the integration's source.
-        "export": [(r"number\..*force_discharge_power$", "number", "{power_w}"),
+        "export": [(r"number\..*force_discharge_power$", "number", "{power_kw}"),
                    (r"select\..*work_mode$", "select", "Force Discharge")],
         "optional": [r"number\..*force_charge_power$", r"number\..*force_charge_max_soc$"],
         "source": "integration",
@@ -392,10 +394,10 @@ PROFILES: dict[str, dict[str, Any]] = {
         "charge": [(r"select\..*battery_pause_mode$", "select", "Not Paused"),
                    (r"number\..*battery_charge_power_limit$", "number", "{power_w}"),
                    ("givenergy_local.enable_timed_charge", "service",
-                    {"device_id": "{device_id}", "start_time": "00:00", "end_time": "23:59", "charge_target": "{target}"})],
+                    {"device_id": "{device_id}", "start_time": "{lease_from}", "end_time": "{lease_to}", "charge_target": "{target}"})],
         # Selling from the battery (only when the user turns it on): checked in the integration's source.
         "export": [(r"select\..*battery_pause_mode$", "select", "Not Paused"),
-                   ("givenergy_local.activate_mode_timed_export", "service", {"device_id": "{device_id}", "start_time": "00:00", "end_time": "23:59"})],
+                   ("givenergy_local.activate_mode_timed_export", "service", {"device_id": "{device_id}", "start_time": "{lease_from}", "end_time": "{lease_to}"})],
         "optional": [r"number\..*battery_charge_power_limit$", r"number\..*battery_discharge_power_limit$"],
     },
     # Solis (Pho3niX90/solis_modbus): remote-control force charge with its power and timeout (1-30 min, so it is
@@ -483,8 +485,12 @@ CHARGER_SERVICES = {
     "keba": {"charge": [("keba.set_current", "service", {"current": "{current}"}), ("keba.enable", "service", {})],
              "stop": [("keba.disable", "service", {})]},
     # Easee (nordicopen/easee_hass): actions with the charger's device
+    # Easee charges at the lower of the charger's and the circuit's dynamic limit: both are set (the circuit's on
+    # all three phases - a car on one phase takes only its own). Last, so charging has started if it's refused.
     "easee": {"charge": [("easee.set_charger_dynamic_limit", "service", {"device_id": "{device_id}", "current": "{current}"}),
-                         ("easee.action_command", "service", {"device_id": "{device_id}", "action_command": "resume"})],
+                         ("easee.action_command", "service", {"device_id": "{device_id}", "action_command": "resume"}),
+                         ("easee.set_circuit_dynamic_limit", "service", {"device_id": "{device_id}", "current_p1": "{current}",
+                                                                          "current_p2": "{current}", "current_p3": "{current}"})],
               "stop": [("easee.action_command", "service", {"device_id": "{device_id}", "action_command": "pause"})]},
     # Zaptec (custom-components/zaptec): "Available current" and the Resume/Stop charging buttons
     "zaptec": {"charge": [(r"number\..*available_current$", "number", "{current}"), (r"button\..*resume_charging$", "press", None)],
@@ -506,6 +512,8 @@ CHARGER_SERVICES = {
                       "stop": [(r"number\..*power_connector_max_current_socket_1$", "number", "0")]},
     # Ohme (built in): no current control - "Charge mode" max charge / paused
     "ohme": {"charge": [(r"select\..*charge_mode$", "select", "max_charge")], "stop": [(r"select\..*charge_mode$", "select", "paused")]},
+    # evcc (marq24/ha-evcc): the loadpoint's "Mode" - now / off (evcc keeps its own current and phases)
+    "evcc_intg": {"charge": [(r"select\..*_mode$", "select", "now")], "stop": [(r"select\..*_mode$", "select", "off")]},
     # myenergi zappi (CJNE/ha-myenergi): "Charge Mode" Fast / Stopped (no current control)
     "myenergi": {"charge": [(r"select\..*charge_mode$", "select", "Fast")], "stop": [(r"select\..*charge_mode$", "select", "Stopped")]},
 }
@@ -524,7 +532,12 @@ def alpha_windows(now: Any) -> dict[str, str]:
         win = {"now_from": "00:00", "now_to": hm(end), "now2_from": "00:00", "now2_to": "00:00"}
     else:  # over midnight: until 23:45, and from 00:00 on (AlphaESS takes periods within one day only)
         win = {"now_from": hm(q), "now_to": "23:45", "now2_from": "00:00", "now2_to": hm(end)}
-    return {**win,
+    # A lease: the inverter's own time slot runs from this quarter to 60-75 minutes ahead (never past midnight) and is
+    # moved on every quarter. Should Energy Pilot, Home Assistant or the network stop, the slot runs out and the inverter
+    # goes back to its normal running by itself - an order is never left standing all day (Growatt, GivEnergy).
+    lease_end = q + timedelta(minutes=75)
+    lease = {"lease_from": hm(q), "lease_to": hm(lease_end) if lease_end.date() == q.date() else "23:59"}
+    return {**win, **lease,
             "park_c_from": hm(q + timedelta(hours=12)), "park_c_to": hm(q + timedelta(hours=12, minutes=15)),
             "park_d_from": hm(q + timedelta(hours=12, minutes=30)), "park_d_to": hm(q + timedelta(hours=12, minutes=45))}
 

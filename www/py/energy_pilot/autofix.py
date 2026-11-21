@@ -7,11 +7,14 @@ is read, or make Energy Pilot more careful. Each is shown as one line with an un
 - A price in øre/cents instead of kroner/euros.
 - A chosen sensor that disappeared (an integration renamed it): the one found in its place is used.
 - A chosen grid or house power sensor stuck for hours, or unavailable: another that works is used.
+- A chosen battery level, battery power or solar sensor unavailable for half an hour: another that works is used.
 
 Anything that steers the inverter or the charger is never changed here.
 """
 
 from __future__ import annotations
+
+import re
 
 from collections import deque
 import statistics
@@ -19,7 +22,10 @@ import time
 from typing import Any
 
 POWER_ROLES = ("pv_power", "battery_power", "grid_power", "house_power", "ev_power")
+# A meter for one phase only (Deye "Load L1 Power", "phase_a") - never taken for the whole house or grid.
+PHASE_METER = re.compile(r"(^|[\s_.-])(l[123]|phase[\s_-]?[abc123])([\s_-]|$)", re.I)
 STUCK_ROLES = ("grid_power", "house_power")  # these never sit still for hours in a lived-in house
+GONE_ROLES = ("battery_soc", "battery_power", "pv_power")  # may sit still (night, idle) - only "unavailable" counts
 ONE_PHASE = {"GB", "IE", "US", "CA", "AU", "NZ", "JP", "MX", "PH"}  # houses mostly on one phase
 STUCK_S = 6 * 3600
 GONE_S = 30 * 60
@@ -86,6 +92,10 @@ class AutoFix:
         self.price_scale()
         self.renamed(st, now)
         self.stuck(st, roles, now)
+        self.gone(st, roles, now)
+
+    def _phases(self) -> int:
+        return 1 if str(self.ov.ha.config.get("country") or "").upper() in ONE_PHASE else 3
 
     def fuse(self) -> None:
         v = _f(self.ov.settings.get("import_limit_kw"))
@@ -107,6 +117,13 @@ class AutoFix:
     def kw_scale(self, roles: dict[str, Any]) -> None:
         """A power sensor whose numbers are kW-sized while the others are in watts, and that doesn't say kW."""
         scale = self.ov.settings.get("role_scale") or {}
+        # Taken for kW, but now it reads hundreds: it was watts all along (an idle battery's few watts looked like kW).
+        # Put back at once, and never again for that sensor.
+        for r, k in list(scale.items()):
+            s = self.samples.get(r) or []
+            if r in POWER_ROLES and k == 1000 and s and max(abs(x) for x in s) > 300:
+                self.undo(f"kw:{r}")
+                scale = self.ov.settings.get("role_scale") or {}
         big = [r for r in POWER_ROLES if (s := self.samples.get(r)) and len(s) >= 30 and max(abs(x) for x in s) > 300]
         if not big:
             return
@@ -115,7 +132,8 @@ class AutoFix:
             s = self.samples.get(r) or []
             e = roles.get(r)
             unit = str(((self.ov.ha.states.get(e or "") or {}).get("attributes") or {}).get("unit_of_measurement") or "").lower()
-            if len(s) < 60 or r in big or scale.get(r) or self._ignored(key) or unit == "kw":
+            # Only a sensor that gives no unit: one that says W is taken at its word (an idle battery shows a few watts).
+            if len(s) < 60 or r in big or scale.get(r) or self._ignored(key) or unit in ("w", "kw", "kwh", "wh"):
                 continue
             moving = [x for x in s if abs(x) >= 0.2]
             if len(moving) >= 20 and max(abs(x) for x in s) <= 30 and any(abs(x - round(x)) > 0.01 for x in moving):
@@ -166,6 +184,26 @@ class AutoFix:
             if alt:
                 self._done(key, "stuck", e, alt, {"roles": {**chosen, role: alt}})
 
+    def gone(self, st: dict[str, Any], roles: dict[str, Any], now: float) -> None:
+        """The user's own battery level, battery power or solar sensor unavailable for half an hour while another that
+        works was found: that one is used (the old one comes back with undo)."""
+        chosen = self.ov.settings.get("roles") or {}
+        for role in GONE_ROLES:
+            e = roles.get(role)
+            key = f"gone:{role}"
+            if not e or self._ignored(key) or chosen.get(role) != e:
+                continue
+            s = st.get(e)
+            if not s or s.get("state") not in ("unavailable", "unknown"):
+                self.gone_since.pop(key, None)
+                continue
+            since = self.gone_since.setdefault(key, now)
+            if now - since < GONE_S:
+                continue
+            alt = self._alternative(role, e, st, now)
+            if alt:
+                self._done(key, "gone", e, alt, {"roles": {**chosen, role: alt}})
+
     def _alternative(self, role: str, bad: str, st: dict[str, Any], now: float) -> str | None:
         from datetime import datetime
 
@@ -173,6 +211,9 @@ class AutoFix:
             e = c.get("entity_id")
             if not e or e == bad or not c.get("guess"):
                 continue
+            name = str(((st.get(e) or {}).get("attributes") or {}).get("friendly_name") or "")
+            if (PHASE_METER.search(e) or PHASE_METER.search(name)) and self._phases() == 3:
+                continue  # one phase of three: the house would look a third of its size
             s = st.get(e) or {}
             try:
                 fresh = now - datetime.fromisoformat(str(s.get("last_changed"))).timestamp() < 3600

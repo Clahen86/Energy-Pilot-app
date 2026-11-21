@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 import json
+import re
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -114,6 +115,10 @@ def _num(state: dict | None) -> float | None:
 
 
 def _watts(state: dict | None) -> float | None:
+    from . import energyrate
+
+    if energyrate.is_energy(state):  # a kWh counter chosen as charging power (Monta): worked out from how fast it rises
+        return energyrate.watts(str((state or {}).get("entity_id") or ""), state)
     v = _num(state)
     if v is None:
         return None
@@ -136,7 +141,7 @@ class Overview:
         from .detect import detect
 
         try:
-            self.detected = await detect(self.ha)
+            self.detected = await detect(self.ha, ((self.settings.get("community") or {}).get("common") or {}).get("sensors"))
         except Exception:  # noqa: BLE001 - keep what was found before
             import logging
 
@@ -162,7 +167,7 @@ class Overview:
                 self.settings.setdefault("roles", {}).update({k: v for k, v in value.items() if k in ROLES})
             elif key in ("battery_kwh", "import_limit_kw", "language", "setup_done", "style", "price_area", "tariff", "markup", "price_source", "tou", "vat", "battery_min_soc", "grid_charge",
                          "sell", "sell_price", "solar_value", "ev_in_house", "battery_sign", "grid_sign", "grid_noise", "ev_follow_sun", "ev_fuse_guard",
-                         "battery_export", "battery_no_export_cheap", "scene_fx", "battery_wear", "battery_type", "battery_price", "fuse_ok", "own_history", "things", "things_dismissed", "power_tariff_price", "power_tariff_kind", "battery_grid_max", "export_limit_kw", "agile_region", "restore_values",
+                         "battery_export", "battery_no_export_cheap", "scene_fx", "battery_wear", "battery_care", "battery_type", "battery_price", "fuse_ok", "own_history", "things", "things_dismissed", "power_tariff_price", "power_tariff_kind", "battery_grid_max", "export_limit_kw", "agile_region", "restore_values",
                          "offgrid", "reserve_soc", "emergency_soc", "gen_stop_soc", "gen_charge_kw", "gen_min_run_h",
                          "quiet_gen_from", "quiet_gen_to", "battery_charge_kw", "battery_discharge_kw", "ev_mode", "charger_kw", "ev_need_kwh",
                          "quiet_from", "quiet_to", "quiet_battery", "quiet_car",
@@ -170,11 +175,11 @@ class Overview:
                          "control", "inverter_profile", "custom_profile", "battery_takeover", "ev_now", "ev_target", "ev_sun_target", "ev_trip", "ev_battery_kwh", "charger_phases", "ev_ready", "ev_switch", "ev_phase_switch",
                          "batteries", "battery_dismissed", "chargers", "charger_dismissed", "battery_targets",
                          # the self-test and what was mended by itself (selftest.py, autofix.py)
-                         "selftest", "profile_fixes", "test_skipped", "autofix_log", "autofix_ignore", "role_scale", "price_scale", "last_report",
+                         "selftest", "observed", "auto_test", "auto_tested", "profile_fixes", "test_skipped", "autofix_log", "autofix_ignore", "role_scale", "price_scale", "last_report",
                          # learning together (telemetry.py)
-                         "install_id", "first_seen", "first_control", "share_anonymous", "telemetry_sent", "community", "community_ignore", "replies", "replies_seen", "last_error", "replies_hidden", "replies_shown",
+                         "install_id", "first_seen", "first_control", "share_anonymous", "telemetry_sent", "hours_sent_day", "community", "community_ignore", "replies", "replies_seen", "last_error", "replies_hidden", "replies_shown",
                          # the update card (telemetry.py)
-                         "latest", "behind", "update_snooze", "update_told",
+                         "latest", "behind", "update_snooze", "update_told", "whatsnew_seen", "changelog_for", "changelog_remote",
                          # stop selling at negative prices (curtail.py)
                          "curtail", "curtail_saved", "curtail_test", "share_full",
                          # storm watch (storm.py)
@@ -182,7 +187,7 @@ class Overview:
                          # the session meter at plug-in (async_plug_marks)
                          "plug_marks", "sell_sun",
                          # which savings the card shows (battery / sun and battery)
-                         "saved_view"):
+                         "saved_view", "report_notes"):
                 self.settings[key] = value
         self.file.write_text(json.dumps(self.settings, indent=2))
 
@@ -249,8 +254,68 @@ class Overview:
         k = (self.settings.get("role_scale") or {}).get(role)
         return v * k if v is not None and k else v
 
+    def _battery_eff(self) -> int | None:
+        """The round-trip efficiency the plan uses now (learned, or the datasheet's), in % - shown with "why it holds"."""
+        try:
+            return round(self.engine.settings().efficiency * 100) if self.engine else None
+        except Exception:  # noqa: BLE001 - only a hint on the front page
+            return None
+
+    def sun_store(self, flow: dict[str, Any], plan: dict[str, Any] | None, now: datetime | None = None) -> dict[str, Any] | None:
+        """Why the sun goes into the battery instead of being sold: the stored kWh is worth more later (sold or used in the
+        house) than the feed-in price now, after the battery's loss. None when the sun isn't being stored or selling is off."""
+        try:
+            if not self.engine or not self.settings.get("sell"):
+                return None
+            pv, house, batt = (flow or {}).get("pv"), (flow or {}).get("house"), (flow or {}).get("battery")
+            if pv is None or batt is None or batt < 50 or pv - (house or 0) < 50:
+                return None  # not charging from a sun surplus
+            res = (self.engine.result or {}).get("battery") or {}
+            steps, slot = res.get("steps") or [], timedelta(minutes=res.get("slot_min") or 60)
+            now = now or datetime.now(ZoneInfo(self.ha.config.get("time_zone") or "UTC"))
+            sells, fixed = self.engine.sell_prices(), float(self.settings.get("sell_price") or 0)
+            sell_now = self.engine.sell_at(sells, now, fixed)
+            hour = {datetime.fromisoformat(h["t"]): h["price"] for h in (plan or {}).get("hours") or [] if h.get("price") is not None}
+            use = []  # (start, worth) of every later slot the battery gives power in
+            for st in steps:
+                t = datetime.fromisoformat(st["t"])
+                if t <= now or st.get("action") not in ("export", "discharge"):
+                    continue
+                v = self.engine.sell_at(sells, t, fixed) if st["action"] == "export" else hour.get(t.replace(minute=0, second=0, microsecond=0))
+                if v is not None:
+                    use.append((t, v))
+            if not use or sell_now is None:
+                return None
+            top = max(v for _, v in use)
+            if top * self.engine.settings().efficiency <= sell_now:
+                return None  # selling now would pay as well: nothing to explain
+            runs: list[list[datetime]] = []  # the dear slots in unbroken runs; the longest is shown (the evening, not one odd slot)
+            for t in sorted(t for t, v in use if v >= top * 0.9):
+                if runs and t - runs[-1][-1] == slot:
+                    runs[-1].append(t)
+                else:
+                    runs.append([t])
+            run = max(runs, key=len)
+            return {"now": sell_now, "p": top, "from": run[0].isoformat(), "to": (run[-1] + slot).isoformat()}
+        except Exception:  # noqa: BLE001 - only a hint on the front page
+            return None
+
+    def battery_pair(self) -> tuple[str, str] | None:
+        """(charge, discharge) when the battery's power is two sensors that each show one way only - Fox ESS Modbus
+        has "Battery Charge" and "Battery Discharge", both 0 or more. Then the power is charge less discharge."""
+        e = self.role("battery_power") or ""
+        m = re.match(r"^(sensor\..*battery_)(dis)?charge(_power)?$", e)
+        if not m:
+            return None
+        other = m.group(1) + ("" if m.group(2) else "dis") + "charge" + (m.group(3) or "")
+        if other not in self.ha.states:
+            return None
+        return (other, e) if m.group(2) else (e, other)
+
     def battery_sign(self) -> int:
         """+1: positive battery power is charging (Growatt). -1: positive is discharging (Fox ESS). Chosen, or found."""
+        if self.battery_pair():
+            return 1  # charge less discharge: always positive when charging
         chosen = self.settings.get("battery_sign")
         if chosen in (1, -1):
             return chosen
@@ -364,7 +429,10 @@ class Overview:
                 # The right kind by device class, or by unit when a template or integration doesn't set one
                 # (Victron, templates that add two solar arrays together …).
                 if cls == "power" and not (dc == "power" or (domain == "sensor" and not dc and unit in ("w", "kw"))):
-                    continue
+                    # A charger without live power (Monta): its kWh counter can be picked - the power is worked out.
+                    if not (name == "ev_power" and domain == "sensor" and unit in ("kwh", "wh")
+                            and a.get("state_class") in ("total_increasing", "total")):
+                        continue
                 if cls == "battery" and not (dc == "battery" or (domain == "sensor" and not dc and unit == "%")):
                     continue
                 # A binary plug sensor, or a charger's status list (VEVOR, OCPP …) that says when the car is in.
@@ -421,7 +489,10 @@ class Overview:
         pv = self.scaled("pv_power", sum(arrays) if arrays else None)  # several arrays are added up
         house = self.scaled("house_power", _watts(st.get(r["house_power"])) if r["house_power"] else None)
         batt = self.scaled("battery_power", _watts(st.get(r["battery_power"])) if r["battery_power"] else None)
-        if batt is not None:
+        if (pair := self.battery_pair()) is not None:
+            c, d = (self.scaled("battery_power", _watts(st.get(x))) for x in pair)
+            batt = None if c is None and d is None else (c or 0) - (d or 0)
+        elif batt is not None:
             batt *= self.battery_sign()  # some integrations (Fox ESS Modbus …) count discharging as positive
         soc = self.scaled("battery_soc", _num(st.get(r["battery_soc"])) if r["battery_soc"] else None)
         packs = None
@@ -470,7 +541,23 @@ class Overview:
             key = "SELL_SUN"  # the sun's surplus is sold, not stored
         text, kind = DECISIONS.get(lang, DECISIONS["en"]).get(key) or DECISIONS["en"][key]
         return {"key": key, "text": text, "kind": kind, "reason": None, "target": b["target"], "plan": [], "engine": True,
-                "saving": b["saving"]}
+                "saving": b["saving"], "blocked": self._not_discharging(key)}
+
+    def _not_discharging(self, key: str) -> bool:
+        """The plan says the battery covers the house, but for 5 minutes it has stood still while the house buys from
+        the grid: the headline then says it is planned, not happening (something else holds the battery back)."""
+        import time
+
+        f = self.flow() or {}
+        b, g, soc = f.get("battery"), f.get("grid"), f.get("soc")
+        idle = key == "FREE_DISCHARGE" and b is not None and -50 < b < 50 and (g or 0) > 100 and (soc is None or soc > 15)
+        if not idle:
+            self._idle_since = None
+            return False
+        now = time.time()
+        if getattr(self, "_idle_since", None) is None:
+            self._idle_since = now
+        return now - self._idle_since >= 300
 
     def decision(self, lang: str) -> dict[str, Any] | None:
         """Energy Pilot's own decision - the same plan as the curve below it. Another system (AppDaemon) that
@@ -572,14 +659,19 @@ class Overview:
                                           (self.engine.own_prices if self.engine else []) or [], tz,
                                           (self.engine.service_prices if self.engine else []) or [], self.price_scale())
         self.fine_prices = prices  # quarter/half-hour prices as they come - the engine plans in those slots
+        if not prices and not self.settings.get("offgrid"):
+            self.price_info["none"] = True  # no prices at all (the market's data is late): the battery runs as normal
         if prices:
             buckets: dict[str, list[float]] = {}
-            for dt, value in prices.items():
+            for dt, value in sorted(prices.items()):
                 if (h := slot(dt)) is not None:
                     buckets.setdefault(h["t"], []).append(value)
             for key, h in hours.items():
                 if h["t"] in buckets:
-                    h["price"] = round(sum(buckets[h["t"]]) / len(buckets[h["t"]]), 3)
+                    b = buckets[h["t"]]
+                    h["price"] = round(sum(b) / len(b), 3)
+                    if len(b) > 1 and max(b) - min(b) > 0.0005:
+                        h["q"] = [round(v, 3) for v in b]  # the hour's quarters (or halves): the graphs draw each
         # Tomorrow's prices before they're out (around 13:00): estimated - replaced by the real ones when they come.
         if self.engine and prices:
             last = max(prices)
@@ -707,7 +799,7 @@ class Overview:
             if (h := slot(datetime.fromisoformat(row["t"]))) is not None:
                 h.setdefault("house", row["kwh"])
         rows = sorted(hours.values(), key=lambda h: h["t"])
-        prices = [h["price"] for h in rows if "price" in h]
+        prices = [p for h in rows if "price" in h for p in (h.get("q") or [h["price"]])]  # the quarters set the scale
         cheapest = sorted((h for h in rows if "price" in h and h["t"] >= now.replace(minute=0, second=0, microsecond=0).isoformat()),
                           key=lambda h: h["price"])[:3]
         return {"now": now.isoformat(), "hours": rows,
@@ -731,8 +823,17 @@ class Overview:
                 "cap_max": ((st.get(r["ev_cap"]) or {}).get("attributes") or {}).get("max") if r["ev_cap"] else None,
                 "session_kwh": chargers.session(st, r["ev_session"], r["ev_plug"],
                                                 (self.settings.get("plug_marks") or {}).get(r["ev_plug"] or "")),
-                **self._ev_soc(),
+                **self._ev_soc(), "charge": self._ev_charge(),
                 "entities": {k: r[k] for k in ("ev_manual", "ev_ready", "ev_cap", "ev_soc")}}
+
+    def _ev_charge(self) -> dict[str, Any] | None:
+        """This charge so far (while plugged in): kWh, what it cost, and how much of it the sun gave."""
+        g = getattr(self.engine, "ghosts", None) if self.engine else None
+        own = (g.part("car").get("own") if g else None) or {}
+        if not own.get("kwh"):
+            return None
+        return {"kwh": round(own["kwh"], 2), "cost": round(own.get("cost", 0.0), 2),
+                "sun": round(min(1.0, own.get("sun_kwh", 0.0) / own["kwh"]), 2)}
 
     def _ev_soc(self) -> dict[str, Any]:
         """The car's own level and the target it charges to (see evsoc.py)."""
@@ -769,6 +870,8 @@ class Overview:
             "house_other": _num(self.ha.states.get(house_e)) if house_e and self.engine and self.engine.house_today() else None,
             "house_other_appdaemon": bool(house_e and "appdaemon" in house_e),
             "settings": self.settings,
+            "battery_eff": self._battery_eff(),
+            "sun_store": self.sun_store(fl, pl),
             "sell_sun": {"on": self.sell_sun(), "can": bool(getattr(self, "controller", None) and self.controller.can_block_sun())},
             "scene": self._scene(),
             "ghosts": self.engine.ghosts.view() if self.engine and getattr(self.engine, "ghosts", None) else {},

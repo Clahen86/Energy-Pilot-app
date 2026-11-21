@@ -329,10 +329,22 @@ class Controller:
         out: dict[str, dict[str, Any]] = {}
         f = self.ov.flow()
         b = res.get("battery")
+        if not (b and b.get("steps")) and self.engine and (getattr(self.ov, "price_info", None) or {}).get("none") \
+                and f.get("soc") is not None:
+            # No prices anywhere, so no plan: the battery isn't left in its last order (a grid charge would run on
+            # without a price) - it runs as normal, the house first, until the prices are back and the plan takes over.
+            b = {"steps": [{"t": datetime.now(ZoneInfo(self.ha.config.get("time_zone") or "UTC")).isoformat(), "action": "normal",
+                            "soc": f["soc"], "grid": 0.0}], "slot_min": 60, "target": f["soc"]}
         if b and b.get("steps"):
             step = b["steps"][0]
             bat = self.engine.settings()
             intent = {"charge_grid": "charge", "hold": "hold", "export": "export"}.get(step["action"], "normal")
+            # A hold only because the sun was to cover the house (nothing bought in the plan): the battery runs as
+            # normal - the same in the plan, but when the house uses more than foreseen it comes from the battery,
+            # not the grid. Not when the sun's surplus is to be sold instead of stored (below).
+            sells_sun = (step.get("grid") or 0.0) < -0.01 and getattr(self.ov, "sell_sun", lambda: False)() and self.can_block_sun()
+            if intent == "hold" and (step.get("grid") or 0.0) <= 0.01 and not sells_sun:
+                intent = "normal"
             slot_h = (b.get("slot_min") or 60) / 60  # the step is one price slot (a quarter of an hour in Europe)
             # The time left of the slot: the battery is to reach the step's level by its end, so the power follows
             # what is really left - not the whole slot (that left the battery above the plan when the house used less).
@@ -365,7 +377,7 @@ class Controller:
                 out["battery"]["ctx"]["house_w"] = int(round((f.get("house") or 0.0) / 50) * 50)
             # The plan holds while the sun has a surplus it sells: the battery mustn't fill up with it anyway (a plain
             # hold still takes the sun). Only inverters whose hold sets the charge limit can do this.
-            if intent == "hold" and (step.get("grid") or 0.0) < -0.01 and getattr(self.ov, "sell_sun", lambda: False)() and self.can_block_sun():
+            if intent == "hold" and sells_sun:
                 out["battery"]["ctx"].update(max_charge_w=0, max_charge_kw=0, sell_sun=True)
         # The car charging on the plan's cheap power right now: the battery holds, so the car takes it from the grid.
         bw = out.get("battery")
@@ -534,9 +546,12 @@ class Controller:
             return self._phase_call(part, want) + self._clamp(adapters.charger_calls(
                 want["intent"], self.entities.get(part, []), self.platforms.get(part), want["ctx"]["current"],
                 self.car_devices.get(part), self.ha.states, switch=self.auto_switch(part)))
-        return self._phase_call("car", want) + self._clamp(adapters.charger_calls(
+        calls = self._clamp(adapters.charger_calls(
             want["intent"], self.entities["car"], self.platforms["car"], want["ctx"]["current"],
             getattr(self, "car_device", None), self.ha.states, switch=self.auto_switch("car")))
+        # The charger test's steps are "start"/"stop" (selftest.py): an option it - or 3 other installations with the
+        # same charger - found works is used instead.
+        return self._phase_call("car", want) + self._fixed("car", "start" if want["intent"] == "charge" else "stop", calls)
 
     def _clamp(self, calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Numbers within the control's own min/max - Home Assistant refuses a value outside them. A select value
@@ -638,6 +653,45 @@ class Controller:
             self.last[part] = entry
             if changed:
                 self.log.setdefault(part, deque(maxlen=60)).appendleft(entry)
+        try:
+            self._observe()
+        except Exception:  # noqa: BLE001 - only watching, never in the way
+            _LOGGER.debug("Observing failed", exc_info=True)
+
+    def _observe(self) -> None:
+        """Daily control as a test: when the battery has done what it was told for a while (the same checks as the
+        self-test), that order counts as working for this profile - once a day each. Only watches; sends nothing."""
+        from .selftest import _expect
+
+        part = "battery"
+        entry = self.last.get(part) or {}
+        if self.mode(part) != "control" or self.blocked(part) or entry.get("result") != "ok" or part in getattr(self, "testing", set()):
+            self._obs = {}
+            return
+        intent, f = entry.get("intent"), self.ov.flow() or {}
+        ctx = entry.get("ctx") or {}
+        if intent == "charge" and (f.get("soc") or 0) >= float(ctx.get("target") or 100) - 2:
+            return  # full enough: charging can't be seen
+        obs = getattr(self, "_obs", {}) or {}
+        if obs.get("intent") != intent:
+            obs = {"intent": intent, "since": time.time(), "ok": 0}
+        if time.time() - obs["since"] < 180:
+            self._obs = obs
+            return  # give it time to react
+        good = _expect(intent, f, {})
+        obs["ok"] = obs["ok"] + 1 if good else 0 if good is False else obs["ok"]
+        self._obs = obs
+        if obs["ok"] < 3:
+            return
+        today = time.strftime("%Y-%m-%d")
+        seen = dict(self.ov.settings.get("observed") or {})
+        if seen.get(intent) == today:
+            return
+        seen[intent] = today
+        self.ov.save({"observed": seen})
+        tel = getattr(self.ov, "telemetry", None)
+        if tel:
+            tel.event("observed", {"profile": self.profile_key(part), "model": getattr(self, "model", None), "intent": intent})
 
     def _battery_volt(self) -> float:
         """The battery's voltage: the BMS voltage on the battery level sensor, a battery voltage sensor, else 52 V."""
@@ -717,8 +771,9 @@ class Controller:
         else one that 3 other installations with the same profile found (telemetry.py) - only when this inverter
         offers it, and never one the user undid."""
         fx = (((self.ov.settings.get("profile_fixes") or {}).get(part) or {}).get(intent)) or {}
+        key = self.profile_key(part) if self.is_battery(part) else f"car:{self.platforms.get(part) or ''}"
         shared = [f for f in ((self.ov.settings.get("community") or {}).get("fixes") or [])
-                  if f.get("profile") == self.profile_key(part) and f.get("intent") == intent
+                  if f.get("profile") == key and f.get("intent") == intent
                   and f"{intent}|{f.get('from')}|{f.get('to')}" not in (self.ov.settings.get("community_ignore") or [])]
         if not fx and not shared:
             return calls
@@ -918,6 +973,28 @@ class Controller:
     def _took(self, calls: list[dict[str, Any]]) -> bool:
         """Did the controls take the values? (Selects and numbers that can be read back.)"""
         return all(self._matches(c) is not False for c in calls)
+
+    async def let_go(self, budget_s: float = 12.0) -> None:
+        """Energy Pilot is stopping (an update, a restart, the app turned off): every battery it controls is put back
+        to normal, so no order is left standing while it's away. The modes are kept - it takes over again when it's
+        back. Quick: no read-back, at most `budget_s` seconds (the Supervisor kills the app soon after asking)."""
+        wants = self.intents()
+        calls = []
+        for part in ["battery", *self.bat_parts()]:
+            if self.mode(part) == "control" and not self.blocked(part) and (want := wants.get(part)):
+                calls += self.calls(part, {**want, "intent": "normal"}) + self._restore(part, "normal")
+        todo = [c for c in calls if not self._matches(c)]
+        end = time.time() + budget_s
+        for c in todo:
+            if time.time() > end:
+                _LOGGER.warning("Stopping: not every control was put back to normal in time")
+                return
+            try:
+                await asyncio.wait_for(self.ha.call_service(c["domain"], c["service"], dict(c["data"])), timeout=max(0.5, end - time.time()))
+            except Exception as err:  # noqa: BLE001 - try the rest
+                _LOGGER.info("Stopping: %s.%s not sent: %s", c["domain"], c["service"], err)
+        if todo:
+            _LOGGER.info("Stopping: the battery is back to normal (%d changes)", len(todo))
 
     async def release(self) -> None:
         """Back to shadow: the battery is put back to normal first, the charger is left as it is."""

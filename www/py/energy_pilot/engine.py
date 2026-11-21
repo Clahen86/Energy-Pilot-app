@@ -130,6 +130,8 @@ def house_forecast(profile: dict[tuple[bool, int], float], hours: list[datetime]
 
 # ---------- battery plan ----------
 
+CARE = {"spare": 1.0, "balanced": 0.5, "most": 0.2}  # share of the battery's wear a move must pay for
+
 @dataclass
 class Battery:
     capacity_kwh: float = 10.0
@@ -253,6 +255,9 @@ def plan_battery(hours: list[Hour], soc_now: float, b: Battery, end_value: float
     n, m = len(hours), len(levels)
     INF = float("inf")
     pct_step = step_pct / 100 * b.capacity_kwh  # kWh between two levels
+    # Selling from the battery must beat buying the kWh back: the cheapest price ahead after the loss, plus the wear
+    # out and in again. Below that it would sell at a loss - also a small rest from rounding to whole steps.
+    refill = (min(h.price for h in hours) / b.efficiency if b.grid_charge else 0.0) + 2 * b.wear
     best = [[INF] * m for _ in range(n + 1)]
     choice: list[list[tuple[int, str, float, float]]] = [[(0, "hold", 0.0, 0.0)] * m for _ in range(n)]
     req = target_levels(hours, b.targets, b.at)
@@ -291,7 +296,7 @@ def plan_battery(hours: list[Hour], soc_now: float, b: Battery, end_value: float
                     need = max(0.0, h.house - h.sun)
                     action = "discharge"
                     if out > need + 1e-9:
-                        if b.export and h.sell > 0 and h.start not in b.no_export:
+                        if b.export and h.sell > 0 and h.start not in b.no_export and h.sell >= refill - 1e-9:
                             action = "export"  # sells what the house doesn't use
                         elif k != j - 1 or need <= 0:
                             continue  # no exporting from the battery
@@ -414,6 +419,13 @@ class Engine:
 
         self.ha, self.ov = ha, overview
         self.learning = Learning(overview.file.parent)
+        from . import common as _common
+
+        self.learning.shared_sun = lambda: _common.sun_bias(self.ov)
+        from .skynet import Sky
+
+        self.sky = Sky()
+        self.sun_now: tuple | None = None
         from .ledger import Ledger
 
         self.ledger = Ledger(overview.file.parent)
@@ -510,11 +522,12 @@ class Engine:
             max_discharge_kw=discharge,
             min_soc=min_soc, grid_charge=grid, import_limit_kw=float(s["import_limit_kw"]) if s.get("import_limit_kw") else None,
             quiet=frozenset(self.quiet_hours("battery")),
-            efficiency=self.batt_learn.efficiency(TYPES[kind]["eff"]),  # the type's, until it has seen the real one
+            # the type's (or what other batteries like it on this inverter give), until it has seen the real one
+            efficiency=self.batt_learn.efficiency(self._shared_eff(kind) or TYPES[kind]["eff"]),
             export=self.can_export(),
             wear=self.wear(cap),
             export_limit_kw=float(s["export_limit_kw"]) if s.get("export_limit_kw") else None,
-            taper=self.batt_learn.taper(),
+            taper=self.batt_learn.taper() or self._shared_taper(),  # its own once seen, else what others' show
             grid_max_soc=max([self.grid_max_soc(kind)] + [t[2] for t in targets] + [x[1] for x in storm_at]),  # a target may go past the limit
             targets=targets, at=storm_at,
             peak_kw=(pt := self.power_tariff()) and pt["limit_kw"],
@@ -567,6 +580,44 @@ class Engine:
         except Exception:  # noqa: BLE001
             return True
 
+    def _shared_eff(self, kind: str) -> float | None:
+        """The round trip other batteries of this kind on this inverter profile give (shared knowledge), or None."""
+        from . import common
+
+        c = getattr(self.ov, "controller", None)
+        try:
+            return common.efficiency(self.ov, c.profile_key("battery") if c else None, kind)
+        except Exception:  # noqa: BLE001 - never in the way of a plan
+            return None
+
+    def _common_info(self, common: Any) -> dict[str, Any]:
+        s, c = self.ov.settings, getattr(self.ov, "controller", None)
+        try:
+            cap = self.settings().capacity_kwh
+        except Exception:  # noqa: BLE001
+            cap = None
+        has = ((self.ov.flow() or {}).get("has") or {}) if hasattr(self.ov, "flow") else {}
+        return common.info(self.ov, len(self.learning.state.get("reports") or []), cap, bool(has.get("ev")),
+                           getattr(c, "model", None) if c else None, self.batt_learn.capacity(),
+                           float(s["battery_kwh"]) if s.get("battery_kwh") else None)
+
+    def home(self) -> tuple[float, float] | None:
+        """The house's position - only used here; the sky network gets the ~10 km cell (skynet.cell)."""
+        try:
+            return float(self.ha.config["latitude"]), float(self.ha.config["longitude"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def _shared_taper(self) -> tuple[tuple[float, float], ...]:
+        """How batteries of this model on this inverter slow down near full (shared knowledge), until its own is seen."""
+        from . import common
+
+        c = getattr(self.ov, "controller", None)
+        try:
+            return common.taper(self.ov, c.profile_key("battery") if c else None, getattr(c, "model", None) if c else None)
+        except Exception:  # noqa: BLE001
+            return ()
+
     def battery_type(self) -> dict[str, Any]:
         """The battery's kind - chosen, or found (the inverter's setting, the model, the learned efficiency)."""
         from . import batterytype
@@ -594,7 +645,10 @@ class Engine:
         bt = self.battery_type()
         cap = capacity_kwh or float(s.get("battery_kwh") or self.batt_learn.capacity() or self._guess_capacity() or 10)
         price = float(s["battery_price"]) if s.get("battery_price") not in (None, "") else None
-        return batterytype.wear(bt["type"], str(self.ha.config.get("currency") or "EUR"), cap, price, bt.get("cycles"))
+        base = batterytype.wear(bt["type"], str(self.ha.config.get("currency") or "EUR"), cap, price, bt.get("cycles"))
+        # The user's choice between sparing the battery (all of its wear counted) and the most saved now (a small part:
+        # the battery ages by time too, so not all of the wear is caused by using it). Only on the worked-out wear.
+        return round(base * CARE.get(str(s.get("battery_care") or "spare"), 1.0), 3) if own else base
 
     def quiet_hours(self, what: str) -> list[int]:
         """The hours the battery or the car must not charge - each has its own (older settings: one shared period)."""
@@ -629,17 +683,20 @@ class Engine:
         """Hourly mean power (kW) from the recorder's statistics."""
         tz = self.tz
         now = datetime.now(tz)
+        unit = str(((self.ha.states.get(entity_id) or {}).get("attributes") or {}).get("unit_of_measurement") or "W").lower()
+        energy = unit in ("kwh", "wh")  # a kWh counter (Monta's charged total): what it rose in an hour is the hour's mean kW
         try:
             res = await self.ha.call_service("recorder", "get_statistics", {
-                "statistic_ids": [entity_id], "period": "hour", "types": ["mean"],
+                "statistic_ids": [entity_id], "period": "hour", "types": ["change" if energy else "mean"],
                 "start_time": (now - timedelta(days=days)).isoformat(), "end_time": now.isoformat()}, response=True)
         except Exception:  # noqa: BLE001
             _LOGGER.debug("No statistics for %s", entity_id, exc_info=True)
             return []
-        unit = str(((self.ha.states.get(entity_id) or {}).get("attributes") or {}).get("unit_of_measurement") or "W").lower()
         rows = []
         for r in ((res or {}).get("response") or {}).get("statistics", {}).get(entity_id, []):
-            start, mean = r.get("start"), r.get("mean")
+            start, mean = r.get("start"), r.get("change" if energy else "mean")
+            if energy and mean is not None:
+                mean = max(0.0, float(mean)) * (1000 if unit == "kwh" else 1)  # -> W, like a power sensor's mean
             if mean is None:
                 continue
             when = datetime.fromtimestamp(start / 1000, tz) if isinstance(start, (int, float)) else datetime.fromisoformat(str(start)).astimezone(tz)
@@ -679,7 +736,11 @@ class Engine:
         from the grid and the sun, less what goes into the battery and the car. Only hours where grid and sun are known."""
         grid = dict(await self._hourly_kw(self.ov.role("grid_power"), days))
         pv = await self._hourly_sum(self.ov.role_all("pv_power"), days)
-        batt = dict(await self._hourly_kw(b, days)) if (b := self.ov.role("battery_power")) else {}
+        if (pair := self.ov.battery_pair()) is not None:  # charge and discharge as two sensors (Fox ESS Modbus)
+            ch, dis = dict(await self._hourly_kw(pair[0], days)), dict(await self._hourly_kw(pair[1], days))
+            batt = {t: ch.get(t, 0.0) - dis.get(t, 0.0) for t in set(ch) | set(dis)}
+        else:
+            batt = dict(await self._hourly_kw(b, days)) if (b := self.ov.role("battery_power")) else {}
         ev = await self._all_cars(days)
         return computed_house(grid, pv, batt, ev, self.ov.grid_sign(), self.ov.battery_sign())
 
@@ -843,7 +904,12 @@ class Engine:
             area = st.get("price_area") or price_area(float(self.ha.config.get("latitude") or 56), float(self.ha.config.get("longitude") or 10),
                                                       self.ha.config.get("country"))
             try:
-                self.own_prices = await fetch_prices(self.ha.session, area, self.tz, st, self.ha.config.get("currency") or "EUR")
+                from . import common as _common
+
+                # No grid tariff typed in: the one neighbours in the same ~10 km cell typed (shared knowledge).
+                shared_tariff = None if st.get("tariff") else _common.tariff(self.ov, self.home())
+                self.own_prices = await fetch_prices(self.ha.session, area, self.tz, {**st, "tariff": shared_tariff} if shared_tariff else st,
+                                                     self.ha.config.get("currency") or "EUR")
                 self._prices_at = time.time()
             except Exception:  # noqa: BLE001
                 _LOGGER.info("No prices from Energi Data Service right now")
@@ -1032,8 +1098,12 @@ class Engine:
 
     def blend_info(self) -> dict[str, Any]:
         """Who decides now, and how well each one hits."""
+        from . import common
+
         return {"house": self.mixer.info("house"), "sun": self.mixer.info("sun"), "price": self.mixer.info("price"),
                 "battery": self.batt_learn.info(0.92), "car": self.habits.info(),
+                "common": self._common_info(common),
+                "sky": self.sky.info(self.home()),
                 "trained": {"house": self.house_model.samples // 24, "sun": self.solar_model.days, "price": self.price_days}}
 
     def sources_used(self) -> dict[str, Any]:
@@ -1051,6 +1121,10 @@ class Engine:
         from . import storm as _storm
 
         self.storm = _storm.find(self.weather, now, self.ov.settings, self.ha.states, getattr(getattr(self.ov, "controller", None), "_ent_reg", None)) if self.ov.settings.get("storm") else None
+        from . import skynet as _sky
+
+        if self.ov.settings.get("storm") and not self.storm:  # grid failing at houses nearby: kept full as for a storm
+            self.storm = _sky.storm(self.sky.outage(self.home()), now)
         start = now.replace(minute=0, second=0, microsecond=0)
         offgrid = bool(self.ov.settings.get("offgrid"))
         if offgrid:
@@ -1078,6 +1152,10 @@ class Engine:
         sun_ml = self.solar_model.predict(times, w) if w else {}
         sw = self.mixer.share("sun")
         sun = [Mixer.mix(s, sun_ml.get(t), sw) for s, t in zip(sun_simple, times)]
+        # The sky network (skynet.py): this hour's own forecast is what the house compares its sun with; the next
+        # hours are pulled towards what the houses upwind see now.
+        self.sun_now = (times[0], sun[0]) if times else None
+        sun = _sky.adjust(self.sky.fresh(), self.home(), times, sun, now, self.weather)
         hours = [Hour(t, r["price"], self.sell_at(sells, t, sell), house[i] + (L.margin if dear is not None and r["price"] >= dear else 0.0), sun[i])
                  for i, (t, r) in enumerate(zip(times, rows))]
         L.expect([{"t": times[0].isoformat(), "house": house[0], "sun": hours[0].sun, "price": rows[0]["price"], "cloud": clouds[0],

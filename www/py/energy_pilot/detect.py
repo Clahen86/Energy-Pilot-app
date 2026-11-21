@@ -35,7 +35,9 @@ NOT_HOME_BATTERY = ("mobile_app", "zha", "matter", "mqtt_room", "ble_monitor", "
                     "bmw_connected_drive", "renault", "kia_uvo", "hyundai_kia_connect", "mercedes_me", "mbapi2020",
                     "polestar_api", "myskoda", "skodaconnect", "audiconnect", "nissan_leaf", "fordpass", "toyota",
                     "volvo", "volvooncall", "stellantis_vehicles", "smartcar", "seatconnect", "cupra_we_connect",
-                    "jlrincontrol", "porscheconnect", "zoe", "leaf", "evcc_intg",
+                    "jlrincontrol", "porscheconnect", "zoe", "leaf", "evcc_intg", "gwm_ora", "mg_saic", "vag_connect", "byd",
+                    # Tibber's own integration: a car's level through Tibber, not a house battery (the shared setups showed it)
+                    "tibber",
                     # Octopus Intelligent: the car's level and charge target (a Tesla was taken for the house battery)
                     "octopus_energy")
 
@@ -108,8 +110,11 @@ WORDS = {
 EXCLUDE = re.compile(r"forecast|prognose|today|daily|total|max|min|limit|setpoint|target|estimate|_rate$|cost|price")
 
 
-async def detect(ha: Any) -> dict[str, dict[str, str]]:
-    """{role: {"entity_id": …, "source": "energy" | "integration:<platform>" | "name"}}"""
+async def detect(ha: Any, shared: dict[str, Any] | None = None) -> dict[str, dict[str, str]]:
+    """{role: {"entity_id": …, "source": "energy" | "integration:<platform>" | "name" | "shared:<platform>"}}
+
+    shared: the sensor finder other installations taught (training/sensors.py) - used only for what the rules here
+    didn't find, so a home that works today is never changed by it."""
     found: dict[str, dict[str, str]] = {}
     try:
         entities = await ha.command({"type": "config/entity_registry/list"})
@@ -248,4 +253,52 @@ async def detect(ha: Any) -> dict[str, dict[str, str]]:
                 best = (score, eid)
         if best and best[0] > 0:
             put(role, best[1], "name")
+
+    # 4. What other installations with the same integration use (the sensor finder) - for what is still missing.
+    if shared:
+        keys, names = shared.get("keys") or {}, shared.get("names") or {}
+        hits: list[tuple[int, int, str, str, str]] = []
+        for e in entities:
+            eid, platform = e["entity_id"], e.get("platform")
+            if e.get("disabled_by") or not platform or not alive(eid):
+                continue
+            k = keys.get(f"{platform}|{e.get('translation_key')}") if e.get("translation_key") else None
+            if k:
+                hits.append((2, int(k.get("n") or 0), str(k.get("role")), eid, platform))
+                continue
+            dom, obj = eid.split(".", 1)
+            for cut in range(len(obj)):
+                if cut == 0 or obj[cut - 1] == "_":
+                    n = names.get(f"{platform}|{dom}|{obj[cut:]}")
+                    if n:
+                        hits.append((1, int(n.get("n") or 0), str(n.get("role")), eid, platform))
+                        break
+        for _how, _n, role, eid, platform in sorted(hits, reverse=True):
+            if role in ROLES_FOUND_BY_FINDER and plausible(role, states.get(eid) or {}):
+                put(role, eid, f"shared:{platform}")
     return found
+
+
+def plausible(role: str, st: dict[str, Any]) -> bool:
+    """A sensor the finder points at is only used when it looks like what the role needs (unit and value) - a wrong
+    rule sent out by mistake can't hand a home a sensor that makes no sense."""
+    a = st.get("attributes") or {}
+    unit = str(a.get("unit_of_measurement") or "")
+    try:
+        val = float(st.get("state"))
+    except (TypeError, ValueError):
+        val = None
+    if role in ("battery_soc", "ev_soc"):
+        return unit == "%" and val is not None and 0 <= val <= 100
+    if role in ("battery_power", "pv_power", "grid_power", "house_power", "ev_power"):
+        lim = {"W": 100_000, "kW": 100}.get(unit)
+        return lim is not None and val is not None and abs(val) <= lim and (role not in ("pv_power", "ev_power", "house_power") or val >= -lim * 0.01)
+    if role == "solar_today":
+        return unit in ("kWh", "Wh") and val is not None and val >= 0
+    if role == "ev_plug":
+        return st.get("state") in ("on", "off")
+    return False
+
+
+ROLES_FOUND_BY_FINDER = {"battery_power", "battery_soc", "pv_power", "grid_power", "house_power", "solar_today",
+                         "ev_power", "ev_plug", "ev_soc"}

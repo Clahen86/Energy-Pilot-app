@@ -50,8 +50,11 @@ def _expect(intent: str, f: dict[str, Any], base: dict[str, Any]) -> bool | None
         return b >= -150  # not discharging (the sun may still charge it)
     if intent == "export":
         return b <= -300 and (g is None or g <= -100)
-    # normal: the battery covers the house again - not charging from the grid, not selling
-    return not (b > 300 and (g or 0) > 300) and not (b < -300 and (g or 0) < -300)
+    # normal: the battery covers the house again - not charging from the grid, not selling, and not standing idle while
+    # the house buys from the grid with charge left (a limit elsewhere, like Victron's "Max inverter power" at 0)
+    soc = f.get("soc")
+    idle_buying = -150 < b < 150 and (g or 0) > 300 and (soc is None or soc > 20)
+    return not (b > 300 and (g or 0) > 300) and not (b < -300 and (g or 0) < -300) and not idle_buying
 
 
 def _expect_car(step: str, f: dict[str, Any], base: dict[str, Any]) -> bool | None:
@@ -121,6 +124,30 @@ class SelfTest:
 
     def stop(self) -> None:
         self._stop = True
+
+    def night_check(self, now: Any) -> bool:
+        """The test by itself (only when the user said yes once - "auto_test"): at night, 2-5, while Energy Pilot
+        doesn't control the battery (in control, daily control tests it - control._observe), when this profile hasn't
+        passed yet - new, mended, or failed more than a week ago. The same test as the button, nothing more."""
+        s = self.ov.settings
+        prof = self.ctl.profile_key("battery")
+        done = s.get("auto_tested") or {}
+        if done.get("pending") and not self.status()["running"]:  # the night's test has ended: what it found
+            res = [r for r in (s.get("selftest") or {}).get("results") or [] if r.get("part") == "battery"]
+            ok = bool(res) and all(r.get("result") in ("ok", "fixed", "skipped") for r in res)
+            self.ov.save({"auto_tested": {"profile": done.get("profile"), "t": time.time(), "ok": ok}})
+            return False
+        if not s.get("auto_test") or not prof or not (2 <= now.hour < 5):
+            return False
+        if self.ctl.mode("battery") == "control" or self.status()["running"] or self.can().get("battery") is not None:
+            return False
+        if done.get("profile") == prof and (done.get("ok") or time.time() - float(done.get("t") or 0) < 7 * 86400):
+            return False
+        if self.start(["battery"]):
+            self.ov.save({"auto_tested": {"profile": prof, "t": time.time(), "pending": True}})
+            _LOGGER.info("Testing the battery by itself tonight (profile %s)", prof)
+            return True
+        return False
 
     def undo(self, part: str, intent: str, entity: str) -> None:
         fx = dict(self.ov.settings.get("profile_fixes") or {})
@@ -290,16 +317,24 @@ class SelfTest:
                 self._result(part, intent, "fixed", entity=e, option_from=c["data"]["option"], option_to=opt)
                 return
         why = "rejected" if sent != "ok" else ("no_reaction" if ok is False else "no_data")
-        if any(self._offline(c["data"].get("entity_id")) for c in calls if isinstance(c["data"].get("entity_id"), str)):
+        gone = [c["data"]["entity_id"] for c in calls if isinstance(c["data"].get("entity_id"), str) and self._offline(c["data"]["entity_id"])]
+        offline_kind = None
+        if gone:
             why = "offline"  # the device's integration went away in Home Assistant (e.g. evcc unreachable), not a refusal
+            # which kind of control (for the developer): its domain and the integration's own key - never the user's name
+            reg = (getattr(self.ctl, "_ent_reg", None) or {}).get(gone[0]) or {}
+            offline_kind = f"{gone[0].split('.')[0]}:{reg.get('translation_key') or '?'}"
         err = getattr(self.ctl, "last_send_error", None) if sent != "ok" else None
         from .checks import ALPHA_PERIOD
         if err and ALPHA_PERIOD.search(err):
             why = "alpha_period"  # AlphaESS changes only a period that exists: one has to be made in its app first
+        from .checks import victron_limit
+        if intent == "normal" and part == "battery" and why == "no_reaction" and victron_limit(self.ctl.ha.states if hasattr(self.ctl, "ha") else {}):
+            why = "victron_limit"  # the battery may not discharge: Victron's own persistent limit is 0
         rejected = [{"entity": c["data"].get("entity_id"), "value": c["data"].get("option", c["data"].get("value"))}
                     for c in calls if self.ctl._matches(c) is False]
         self._result(part, intent, "failed", why=why, rejected=rejected, error=err,
-                     seen={k: f.get(k) for k in ("battery", "grid", "ev") if f})
+                     seen={k: f.get(k) for k in ("battery", "grid", "ev") if f}, **({"offline": offline_kind} if offline_kind else {}))
 
     def _alternatives(self, calls: list[dict[str, Any]]) -> list[tuple[dict[str, Any], str]]:
         """Other safe options for the selects in a step, the most alike first; at most a handful in all."""

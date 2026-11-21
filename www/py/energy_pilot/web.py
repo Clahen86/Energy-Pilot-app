@@ -33,6 +33,21 @@ def _fixed_lines(overview: Overview) -> list:
     return lines
 
 
+ASK_AGAIN_S = 14 * 86400  # a skipped self-test is offered again after two weeks
+
+
+def test_skipped(v: object, now: float | None = None) -> bool:
+    """Skipped the self-test: for good when it was skipped before this came (True), else for two weeks."""
+    import time
+
+    if isinstance(v, bool) or v is None:
+        return bool(v)
+    try:
+        return (now or time.time()) - float(v) < ASK_AGAIN_S
+    except (TypeError, ValueError):
+        return False
+
+
 def _tested(overview: Overview) -> dict | None:
     """The last self-test in short, for the status light: none / ok / fixed / failed, and whether it runs."""
     t = getattr(overview, "selftest", None)
@@ -42,7 +57,7 @@ def _tested(overview: Overview) -> dict | None:
     res = st.get("results") or []
     running = bool(t._task and not t._task.done())
     if not res and not running:
-        return {"result": "none", "skipped": bool(overview.settings.get("test_skipped"))}
+        return {"result": "none", "skipped": test_skipped(overview.settings.get("test_skipped"))}
     worst = "failed" if any(r["result"] == "failed" for r in res) else "fixed" if any(r["result"] == "fixed" for r in res) else "ok"
     return {"result": worst, "running": running, "report_url": t.report_url() if res and worst == "failed" else None}
 
@@ -335,6 +350,17 @@ def make_app(runner: Runner, overview: Overview) -> web.Application:
     app.router.add_post("/api/settings", save_settings)
     app.router.add_post("/api/detect", redetect)
 
+    async def entity_info(req: web.Request) -> web.Response:
+        """A control's choices for the guide to an own profile: a select's options, a number's range, its value now."""
+        out = {}
+        for e in str(req.query.get("e", "")).split(",")[:40]:
+            s = overview.ha.states.get(e) or {}
+            a = s.get("attributes") or {}
+            out[e] = {"state": s.get("state"), "options": a.get("options") if isinstance(a.get("options"), list) else None,
+                      "min": a.get("min"), "max": a.get("max"), "unit": a.get("unit_of_measurement"),
+                      "name": a.get("friendly_name")}
+        return web.json_response(out)
+
     async def control_status(_req: web.Request) -> web.Response:
         c = overview.controller
         return web.json_response(c.status() if c else {})
@@ -437,7 +463,11 @@ def make_app(runner: Runner, overview: Overview) -> web.Application:
                         return web.json_response({"error": res.get("error") or f"http_{r.status}"}, status=502)
         except Exception as err:  # noqa: BLE001
             return web.json_response({"error": "unreachable", "detail": str(err)[:200]}, status=502)
-        overview.save({"last_report": {"id": res.get("id"), "t": __import__("time").time()}, "replies": {}})
+        notes = dict(overview.settings.get("report_notes") or {})
+        if res.get("id") and payload["note"].strip():  # the question is shown above the answers
+            notes[str(res["id"])] = payload["note"].strip()
+        overview.save({"last_report": {"id": res.get("id"), "t": __import__("time").time()}, "replies": {},
+                       "report_notes": dict(list(notes.items())[-10:])})
         return web.json_response({"ok": True, "id": res.get("id")})
 
     async def report_info(_req: web.Request) -> web.Response:
@@ -451,20 +481,26 @@ def make_app(runner: Runner, overview: Overview) -> web.Application:
         got = overview.settings.get("replies") or {}
         if tel.answer_every() and __import__("time").time() - float(got.get("t") or 0) > 300:
             await tel.fetch_answers()
-        return web.json_response({**tel.visible(mark_seen=True), "update": tel.update()})
+        return web.json_response({**tel.visible(mark_seen=True), "update": tel.update(), "whatsnew": tel.whatsnew()})
 
     async def replies_post(req: web.Request) -> web.Response:
         tel = getattr(overview, "telemetry", None)
         b = await req.json() if req.can_read_body else {}
+        if tel and b.get("whatsnew_seen"):  # "OK" on "What's new"
+            tel.whatsnew_seen()
+            return web.json_response({"ok": True, "whatsnew": None})
         if tel and b.get("snooze"):  # "Later" on the update card: hidden for 7 days
             tel.snooze()
             return web.json_response({"ok": True, "update": tel.update()})
         if tel and b.get("hide"):  # "Close" on an answer - it comes back with a new comment
             tel.hide(str(b["hide"]))
             return web.json_response({"ok": True, "replies": tel.visible()})
-        if not tel or not str(b.get("text") or "").strip():
+        images = [{"name": str(i.get("name") or "picture")[:60], "data": i["data"]}
+                  for i in (b.get("images") or [])[:3]
+                  if isinstance(i, dict) and isinstance(i.get("data"), str) and len(i["data"]) <= 2_000_000]
+        if not tel or not (str(b.get("text") or "").strip() or images):
             return web.json_response({"ok": False, "error": "content"}, status=400)
-        res = await tel.write_back(b.get("id"), b.get("text"))
+        res = await tel.write_back(b.get("id"), b.get("text"), images)
         return web.json_response({**res, "replies": tel.visible()}, status=200 if res.get("ok") else 502)
 
     app.router.add_post("/api/report", report)
@@ -476,6 +512,7 @@ def make_app(runner: Runner, overview: Overview) -> web.Application:
     app.router.add_get("/api/selftest", selftest_get)
     app.router.add_post("/api/selftest", selftest_post)
     app.router.add_get("/api/control", control_status)
+    app.router.add_get("/api/entity_info", entity_info)
     app.router.add_post("/api/control", control_mode)
     app.router.add_post("/api/control/release", control_release)
     app.router.add_post("/api/ev", ev)

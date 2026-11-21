@@ -139,12 +139,36 @@ class Telemetry:
         }
         if bat_int:
             out["battery_integration"] = str(bat_int)[:40]
+        if eng:  # what it has learned itself, for the shared knowledge (common.py) - two ratios, rounded
+            try:
+                ls = eng.learning.state
+                learned: dict[str, Any] = {"days": len(ls.get("reports") or []),
+                                           "sun": {k: round(float(v), 2) for k, v in (ls.get("solar_bias") or {}).items() if k in ("cloudy", "clear")}}
+                m = eng.batt_learn._medians()
+                if m and m[2] >= 5:
+                    learned["eff"] = round(min(0.95, max(0.7, m[1] / m[0])), 2)
+                    learned["battery_type"] = eng.battery_type()["type"]
+                if (lc := eng.batt_learn.capacity()) and s.get("battery_kwh"):  # the battery's health (common.py)
+                    learned["cap"], learned["nominal"] = round(float(lc), 1), round(float(s["battery_kwh"]), 1)
+                tf, home = s.get("tariff"), eng.home()
+                if isinstance(tf, dict) and home and all(isinstance(tf.get(k), (int, float)) for k in ("low", "high", "peak")):
+                    from . import skynet
+
+                    # the grid tariff the user typed in, for neighbours with the same grid company (public prices)
+                    learned["tariff"] = {k: round(float(tf[k]), 3) for k in ("low", "high", "peak")}
+                    learned["cell"] = skynet.cell(*home)
+                if tp := eng.batt_learn.taper():
+                    learned["taper"] = [[float(lvl), float(sh)] for lvl, sh in tp]
+                out["learned"] = learned
+            except Exception:  # noqa: BLE001
+                pass
         return out
 
     def test_result(self, results: list[dict[str, Any]]) -> None:
         c = getattr(self.ov, "controller", None)
-        keep = ("part", "step", "result", "why", "option_from", "option_to")
+        keep = ("part", "step", "result", "why", "option_from", "option_to", "offline")
         self.event("test", {"profile": c.profile_key("battery") if c else None, "model": getattr(c, "model", None) if c else None,
+                            "version": os.environ.get("BUILD_VERSION", "dev"),
                             "charger": c.platforms.get("car") if c else None,
                             "results": [{k: r.get(k) for k in keep if r.get(k) is not None} for r in results]})
 
@@ -226,6 +250,8 @@ class Telemetry:
                     continue
                 if mark_seen and new and (not sh or sh.get("t") != new):
                     shown[k], changed = {"t": new, "at": now}, True
+                if kind == "reports" and not r.get("question"):  # what the user asked, kept here when it was sent
+                    r = {**r, "question": (self.ov.settings.get("report_notes") or {}).get(str(r.get("id"))) or None}
                 out[kind].append({**r, "key": k})
         if changed:
             keep = {self._key(r) for kind in ("reports", "notes") for r in got.get(kind) or []}
@@ -277,8 +303,55 @@ class Telemetry:
         sn = self.ov.settings.get("update_snooze") or {}
         snoozed = now < float(sn.get("until") or 0) and not (big and self._ver(lv)[:2] > self._ver(sn.get("version"))[:2])
         due = bool(fixed) or (now - float(since[lv]) >= (2 if big else 7) * DAY_S and not snoozed)
+        from . import changelog
+
+        changes = changelog.between(changelog.parse(str(self.ov.settings.get("changelog_remote") or "")), cur, lv)
         return {"version": lv, "current": cur, "note": str(lt.get("note") or ""), "important": bool(lt.get("important")),
-                "repo": str(lt.get("repo") or ""), "big": big, "fixed": fixed, "due": due}
+                "repo": str(lt.get("repo") or ""), "big": big, "fixed": fixed, "due": due, "changes": changes}
+
+    def whatsnew(self) -> dict[str, Any] | None:
+        """After an update: what changed since the version that was here before - once, until "OK"."""
+        from . import changelog
+
+        cur = os.environ.get("BUILD_VERSION", "dev")
+        if cur == "dev":
+            return None
+        seen = str(self.ov.settings.get("whatsnew_seen") or "")
+        if not seen:
+            self.ov.save({"whatsnew_seen": cur})  # a new install: nothing is new to them
+            return None
+        if self._ver(seen) >= self._ver(cur):
+            return None
+        changes = changelog.between(changelog.local(), seen, cur)
+        if not changes:
+            self.ov.save({"whatsnew_seen": cur})
+            return None
+        return {"from": seen, "to": cur, "changes": changes}
+
+    def whatsnew_seen(self) -> None:
+        self.ov.save({"whatsnew_seen": os.environ.get("BUILD_VERSION", "dev")})
+
+    async def fetch_changelog(self) -> None:
+        """The newest CHANGELOG.md from GitHub, when a newer version is out - so the update card lists what it brings."""
+        import aiohttp
+
+        from . import changelog
+
+        lt, cur = self.ov.settings.get("latest") or {}, os.environ.get("BUILD_VERSION", "dev")
+        lv = str(lt.get("version") or "")
+        if not lv or cur == "dev" or self._ver(lv) <= self._ver(cur) or self.ov.settings.get("changelog_for") == lv:
+            return
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(changelog.REMOTE, timeout=aiohttp.ClientTimeout(total=20)) as r:
+                    if r.status != 200:
+                        return
+                    text = await r.text()
+        except Exception:  # noqa: BLE001
+            return
+        keep = changelog.between(changelog.parse(text), cur, lv, most=12, items=8)
+        self.ov.save({"changelog_for": lv, "changelog_remote": "\n".join(
+            [f"## {c['version']} – {c['date']}\n" + "\n".join(f"- {i}" for i in c["items"]) for c in keep])})
 
     async def _update_notices(self) -> None:
         """A notification in Home Assistant (never on the phone): an error it had is fixed, or 30 days behind something important."""
@@ -324,6 +397,7 @@ class Telemetry:
         self._keep_sent(got)
         if isinstance(d.get("latest"), dict) and d["latest"].get("version"):
             self.ov.save({"latest": d["latest"]})
+            await self.fetch_changelog()
         newest = max((str(m.get("t") or "") for r in got["reports"] + got["notes"] for m in r.get("msgs") or [] if m.get("from") == "dev"), default="")
         seen = self.ov.settings.get("replies_seen")
         seen = seen if isinstance(seen, str) else ""
@@ -351,15 +425,15 @@ class Telemetry:
             if any(m.get("from") == "you" and str(m.get("text") or "").strip() == x["text"] for m in msgs):
                 sent.remove(x)  # GitHub has it now
             else:
-                msgs.append({"from": "you", "text": x["text"], "t": x["iso"]})
+                msgs.append({"from": "you", "text": x["text"], "t": x["iso"], **({"pics": x["pics"]} if x.get("pics") else {})})
         self._sent = sent
 
-    async def write_back(self, report_id: str, text: str) -> dict[str, Any]:
-        d = await self._ask("/reply", {"id": str(report_id)[:40], "text": str(text)[:4000]})
+    async def write_back(self, report_id: str, text: str, images: list[dict[str, str]] | None = None) -> dict[str, Any]:
+        d = await self._ask("/reply", {"id": str(report_id)[:40], "text": str(text or "")[:4000], "images": images or []})
         if d and d.get("ok"):
             from datetime import datetime, timezone
 
-            self._sent = getattr(self, "_sent", []) + [{"id": str(report_id)[:40], "text": str(text)[:4000].strip(), "t": time.time(),
+            self._sent = getattr(self, "_sent", []) + [{"id": str(report_id)[:40], "text": str(text or "")[:4000].strip(), "pics": len(images or []), "t": time.time(),
                                                          "iso": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}]
             got = await self.fetch_answers(notify=False)
             if "reports" in got and got.get("t", 0) < time.time() - 5:  # the fetch failed: shown from what's stored
@@ -371,12 +445,15 @@ class Telemetry:
     # ---------- the daily round ----------
     async def run(self) -> None:
         """Every 10 minutes: the daily line when a day has gone, and the shared fixes once a day."""
+        asyncio.get_running_loop().create_task(self.sky_loop())
         while True:
             try:
                 now = time.time()
                 if self.on and now - float(self.ov.settings.get("telemetry_sent") or 0) >= DAY_S:
                     if await self._post("daily", {"data": self.daily()}):
                         self.ov.save({"telemetry_sent": now})
+                if self.on:
+                    await self.send_hours()
                 if self.url and now - float((self.ov.settings.get("community") or {}).get("t") or 0) >= DAY_S:
                     await self.fetch_fixes()
                 # every 10 minutes the first week after a report or an error, hourly until 60 days, then once a day
@@ -386,6 +463,67 @@ class Telemetry:
             except Exception:  # noqa: BLE001
                 _LOGGER.debug("Telemetry round failed", exc_info=True)
             await asyncio.sleep(600)
+
+    def hours_line(self) -> dict[str, Any] | None:
+        """Yesterday hour by hour, as the nightly review saw it: the house's use and the sun (forecast and real), the
+        battery's level (planned and real) and the price - for the models trained on all houses. No clock times
+        beyond the day, no names, no entities."""
+        eng = getattr(self.ov, "engine", None)
+        reports = (getattr(getattr(eng, "learning", None), "state", None) or {}).get("reports") or []
+        last = reports[-1] if reports else None
+        if not last or not last.get("hours") or last.get("day") == self.ov.settings.get("hours_sent_day"):
+            return None
+        rows = []
+        for r in last["hours"][:25]:
+            pair = lambda k: (list(r.get(k) or [None, None]) + [None, None])[:2]  # noqa: E731
+            rows.append({"h": r.get("h"), "house": pair("house"), "sun": pair("sun"), "soc": pair("soc"), "price": r.get("price")})
+        return {"day": last["day"], "hours": rows}
+
+    async def send_hours(self) -> None:
+        line = self.hours_line()
+        if line and await self._post("hours", line):
+            self.ov.save({"hours_sent_day": line["day"]})
+
+    async def sky_loop(self) -> None:
+        """The sky network (skynet.py), every quarter of an hour: this house's sun against its forecast and its grid,
+        for its ~10 km cell - and back what the houses around see."""
+        from . import skynet
+
+        volt = None
+        while True:
+            try:
+                eng = getattr(self.ov, "engine", None)
+                home = eng.home() if eng else None
+                if self.on and home:
+                    states = self.ov.ha.states
+                    volt = volt or skynet.grid_voltage_entity(states)
+                    ratio, sn = None, getattr(eng, "sun_now", None)
+                    pv = (self.ov.flow() or {}).get("pv") if hasattr(self.ov, "flow") else None
+                    if pv is not None and sn and sn[1] >= 0.2:
+                        from datetime import datetime
+
+                        if 0 <= (datetime.now(sn[0].tzinfo) - sn[0]).total_seconds() < 3600:
+                            ratio = round(max(0.0, float(pv)) / 1000 / sn[1], 2)
+                    down = skynet.grid_down(states, volt)
+                    if ratio is not None or down is not None:
+                        d = await self._sky_post({"install": self.ov.settings.get("install_id"), "cell": skynet.cell(*home),
+                                                  "ratio": ratio, "down": down})
+                        if isinstance(d, dict) and isinstance(d.get("near"), list):
+                            eng.sky.update(d["near"][:400])
+            except Exception:  # noqa: BLE001 - never in the way
+                _LOGGER.debug("Sky round failed", exc_info=True)
+            await asyncio.sleep(skynet.EVERY_S)
+
+    async def _sky_post(self, body: dict[str, Any]) -> dict[str, Any] | None:
+        import aiohttp
+
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.post(f"{self.url}/sky", json=body, headers={"x-ep-client": "energy-pilot"},
+                                  timeout=aiohttp.ClientTimeout(total=20)) as r:
+                    return await r.json(content_type=None) if r.status == 200 else None
+        except Exception:  # noqa: BLE001
+            return None
 
     async def fetch_fixes(self) -> None:
         import aiohttp
@@ -398,7 +536,10 @@ class Telemetry:
                     d = await r.json(content_type=None)
         except Exception:  # noqa: BLE001
             return
-        self.ov.save({"community": {"fixes": (d.get("fixes") or [])[:500], "tested": d.get("tested") or {}, "t": time.time()}})
+        common = d.get("common") if isinstance(d.get("common"), dict) else {}
+        self.ov.save({"community": {"fixes": (d.get("fixes") or [])[:500], "tested": d.get("tested") or {},
+                                    "common": {k: v for k, v in common.items() if k in ("sun", "eff", "taper", "peers", "health", "tariff", "sensors") and isinstance(v, dict)},
+                                    "t": time.time()}})
 
 
 class ErrorHandler(logging.Handler):
