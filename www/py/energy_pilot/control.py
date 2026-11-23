@@ -53,6 +53,10 @@ def steady(prev: dict | None, want: dict) -> dict:
     return {**want, "ctx": new}
 
 
+YAML_CONTROLS = re.compile(r"^(select\.(ems_mode|battery_forced_charge_discharge)|number\.battery_(forced_charge_discharge_power|"
+                           r"max_charge_power|max_discharge_power|min_soc|max_soc))$")
+
+
 class Controller:
     def __init__(self, ha: Any, overview: Any, engine: Any) -> None:
         self.ha, self.ov, self.engine = ha, overview, engine
@@ -154,6 +158,8 @@ class Controller:
             return
         by_id = {e["entity_id"]: e for e in entities}
         self._ent_reg = by_id  # (the setup for the developer: setupinfo.py)
+        # Entity ids in the user's language: the integration's own key as a second name the profiles match too.
+        adapters.ALIASES = {e["entity_id"]: a for e in entities if (a := adapters.alias_for(e["entity_id"], e.get("translation_key")))}
         self.phones = {e["entity_id"] for e in entities if e.get("platform") == "mobile_app"}  # phones and tablets
         try:
             devices = {d["id"]: d for d in await self.ha.command({"type": "config/device_registry/list"})}
@@ -192,6 +198,11 @@ class Controller:
             if not found and anchor and part == "battery":  # MQTT inverters: same name prefix (never for a charger)
                 prefix = anchor.split(".", 1)[1].split("_")[0]
                 found = [e for e in self.ha.states if e.split(".")[0] in ("select", "number", "switch") and e.split(".", 1)[1].startswith(prefix + "_")]
+            if part == "battery" and (not dev or plat in ("modbus", "template")):
+                # mkaiser's Sungrow package (and YAML inverters like it): its battery controls are template selects
+                # and numbers without a device - picked up by their fixed names.
+                found += [e["entity_id"] for e in entities if not e.get("disabled_by") and e["entity_id"] not in found
+                          and YAML_CONTROLS.match(e["entity_id"])]
             self.entities[part], self.platforms[part] = sorted(found), plat
             if part == "car":
                 self.car_device = dev  # Easee's actions want the charger's device
@@ -338,7 +349,7 @@ class Controller:
         if prof.get("anywhere"):
             pats = [st[0] for i in ("normal", "hold", "charge", "export") for st in prof.get(i, []) if isinstance(st[0], str)]
             extra = [e for e in self.ha.states if e not in own and e.split(".")[0] in ("select", "number", "switch", "button")
-                     and any(re.search(p, e) for p in pats)]
+                     and any(adapters.hit(p, e) for p in pats)]
             return own + sorted(extra)
         return own
 
@@ -421,12 +432,8 @@ class Controller:
             # hold still takes the sun). Only inverters whose hold sets the charge limit can do this.
             if intent == "hold" and sells_sun:
                 out["battery"]["ctx"].update(max_charge_w=0, max_charge_kw=0, sell_sun=True)
-        # The car charging on the plan's cheap power right now: the battery holds, so the car takes it from the grid.
-        bw = out.get("battery")
-        cw = out.get("car")
-        if bw and cw and bw["intent"] == "normal" and cw["intent"] == "charge" and not self.ov.settings.get("ev_now") \
-                and self.car_why.startswith("planned"):
-            out["battery"] = {**bw, "intent": "hold"}
+        # The car charging: the battery plan has its charge in (engine.car_load) and decides itself whether the
+        # battery helps it or holds - no fixed rule here.
         if out.get("battery") and self.bat_parts():
             out.update(self._share(out["battery"], f))
         g = res.get("generator")
@@ -457,6 +464,10 @@ class Controller:
                 else:
                     need = 0.0  # at its limit: it stops, in the sun too (spares the battery)
             st["onoff"] = self.onoff("car")
+            if self.engine and f.get("soc") is not None:
+                bat = self.engine.settings()
+                if not bat.grid_charge and f["soc"] < bat.max_soc - 1:
+                    st["batt_sun_w"] = bat.max_charge_kw * 1000  # only the sun can fill it: it gets the sun first
             st["min_a"] = adapters.lowest_amps(getattr(self, "entities", {}).get("car", []), getattr(getattr(self, "ha", None), "states", {}))
             st.update(self._phase_settings("car", st))
             d = decide(f, st, hour in planned, manual, need, self._sun_on)
